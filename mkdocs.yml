@@ -41,6 +41,7 @@ nav:
           - Escalation-Router Routing: routing_algorithms/escalation_router_routing.md
           - Advisor-Gate Routing: routing_algorithms/advisor_gate_routing.md
           - Verification-Gated Routing: routing_algorithms/vgr_routing.md
+          - QLC Routing: qlc_router.md
       - Choose Models: routing_algorithms/model_selection.md
   - Evaluate Routing:
       - Benchmarks: benchmarks.md
@@ -73,6 +74,7 @@ nav:
 exclude_docs: |
   internal/**
   research/**
+  overview.md
   vllm-serve-hidden-state.md
 
 theme:

@@ -287,6 +287,35 @@ Splits traffic across targets. See
 | `weights` | No | equal | Finite, non-negative relative weights in `targets` order, with at least one positive value. Invalid weights are rejected at load time. |
 | `seed` | No | unset | Reproduces the selection sequence. |
 
+### `qlc`
+
+Filters candidates by hard requirements, then ranks the rest by quality,
+latency, and cost. See [QLC Routing](../qlc_router.md).
+
+| Key | Required | Default | Meaning |
+|---|:---:|---|---|
+| `weight_quality` | No | `1.0` | Weight for `quality_score`. |
+| `weight_latency` | No | `1.0` | Weight for `latency_score`. |
+| `weight_cost` | No | `1.0` | Weight for `cost_score`. |
+| `max_latency_ms` | No | unset | Removes candidates whose `estimated_latency_ms` is above this value. |
+| `require_local` | No | `false` | Keeps only candidates with `local = true`. |
+| `candidates` | Yes | — | Array of tables. Each entry names one target and its values. |
+
+Each `[[routes.<name>.candidates]]` entry accepts:
+
+| Key | Required | Default | Meaning |
+|---|:---:|---|---|
+| `target` | Yes | — | Target name from `[targets]`. |
+| `quality_score` | Yes | — | Quality score from `0` to `1`. |
+| `latency_score` | Yes | — | Latency score from `0` to `1`. Higher is faster. |
+| `cost_score` | Yes | — | Cost score from `0` to `1`. Higher is cheaper. |
+| `estimated_latency_ms` | If `max_latency_ms` is set | unset | Estimated latency in milliseconds. |
+| `context_window` | No | unlimited | Largest context the candidate supports. |
+| `vision` | No | `false` | Whether the candidate accepts image input. |
+| `tool_calling` | No | `false` | Whether the candidate supports tool calls. |
+| `local` | No | `false` | Whether the candidate satisfies a local-only requirement. |
+| `available` | No | `true` | Whether the candidate is taking traffic. |
+
 ### `plan_execute`
 
 Plans on a capable target, then switches to an efficient target after the first

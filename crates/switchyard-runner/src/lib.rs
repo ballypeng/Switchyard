@@ -24,8 +24,8 @@ pub use config::{ConfiguredTarget, RouteTargets, TargetModel, api_key_variables,
 pub use algorithm::{
     AdvisorTriggerConfig, AlgorithmConfigError, AlgorithmSpec, CategoryModelConfig, ClassifierMode,
     ClassifierPolicyConfig, DecisionJudgeRouteConfig, LlmClassifierRouteConfig, PlanExecuteTrigger,
-    StageClassifierConfig, StageProfileConfig, StageSettingsConfig, SubagentRouteConfig,
-    VgrModeConfig, VgrRouteConfig,
+    QlcCandidateConfig, StageClassifierConfig, StageProfileConfig, StageSettingsConfig,
+    SubagentRouteConfig, VgrModeConfig, VgrRouteConfig,
 };
 #[cfg(not(target_os = "wasi"))]
 pub use algorithm_factory::AlgorithmFactory;
