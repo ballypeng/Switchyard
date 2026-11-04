@@ -307,7 +307,7 @@ Each `[[routes.<name>.candidates]]` entry accepts:
 |---|:---:|---|---|
 | `target` | Yes | — | Target name from `[targets]`. |
 | `quality_score` | Yes | — | Quality score from `0` to `1`. |
-| `latency_score` | Yes | — | Latency score from `0` to `1`. Higher is faster. |
+| `latency_score` | Yes | — | Latency score from `0` to `1`. Higher is faster. A local candidate loses `0.05` for each concurrent request, counting routing, selected, and calling requests, down to `0`. |
 | `cost_score` | Yes | — | Cost score from `0` to `1`. Higher is cheaper. |
 | `estimated_latency_ms` | If `max_latency_ms` is set | unset | Estimated latency in milliseconds. |
 | `context_window` | No | unlimited | Largest context the candidate supports. |

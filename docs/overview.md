@@ -578,17 +578,42 @@ flowchart TB
 5. 最后读 `crates/switchyard-server/src/lib.rs`，看 HTTP 请求如何接入整条链路。
 6. 需要扩展语言或网关时，再读对应的绑定或集成目录。
 
-
-构建：
+## 9. 构建和运行
+### 编译构建：
 cargo build --locked --release -p switchyard-server
-使用：
+
+### 使用：
+mac：
+export NVIDIA_API_KEY="xxx"
+./target/release/switchyard-server --config dev-server/config.toml --host 127.0.0.1 --port 4000 --routing-log-file logs/routing.jsonl
+
+windows：
 .\target\release\switchyard-server.exe --config dev-server\config.toml --host 127.0.0.1 --port 4000 --routing-log-file logs\routing.jsonl
-健康检查：
+
+### 健康检查：
 curl http://127.0.0.1:4000/health
 curl http://127.0.0.1:4000/v1/models
 
-请求：
+### 请求：
+curl -i http://127.0.0.1:4000/v1/chat/completions \
+    -H 'content-type: application/json' \
+    -d '{"model":"switchyard/qlc","messages":[{"role":"user","content":"hello"}]}'
+
+指定session-id:
 curl -i http://127.0.0.1:4000/v1/chat/completions \
     -H 'content-type: application/json' \
     -H 'x-switchyard-session-id: demo' \
     -d '{"model":"switchyard/qlc","messages":[{"role":"user","content":"hello"}]}'
+
+决策接口：
+curl -i http://127.0.0.1:4000/v1/decision \
+    -H 'content-type: application/json' \
+    -d '{
+      "input_format": "openai_chat",
+      "request": {
+        "model": "switchyard/qlc",
+        "messages":[
+          {"role":"user", "content":"hello"}
+        ]
+      }
+      }'

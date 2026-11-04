@@ -9,6 +9,7 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 use switchyard_protocol::{ContentBlock, LlmRequest, ModelId, Request};
@@ -61,6 +62,12 @@ pub struct QlcConfig {
 /// Routes by filtering candidates, then ranking them with a configured score.
 pub struct Qlc {
     config: QlcConfig,
+    /// Calls in flight for each local candidate, indexed like `config.candidates`.
+    in_flight: Vec<AtomicUsize>,
+    /// Requests routing to each local candidate right now, indexed like `config.candidates`.
+    routing: Vec<AtomicUsize>,
+    /// Requests that selected a local candidate but have not started its call yet.
+    reserved: Vec<AtomicUsize>,
 }
 
 impl Qlc {
@@ -103,13 +110,41 @@ impl Qlc {
                 )));
             }
         }
-        Ok(Self { config })
+        let in_flight = config
+            .candidates
+            .iter()
+            .map(|_| AtomicUsize::new(0))
+            .collect();
+        let routing = config
+            .candidates
+            .iter()
+            .map(|_| AtomicUsize::new(0))
+            .collect();
+        let reserved = config
+            .candidates
+            .iter()
+            .map(|_| AtomicUsize::new(0))
+            .collect();
+        Ok(Self {
+            config,
+            in_flight,
+            routing,
+            reserved,
+        })
     }
 
-    fn score(&self, candidate: &QlcCandidate) -> f64 {
+    fn score(&self, candidate: &QlcCandidate, in_flight: usize) -> f64 {
+        let latency_score = effective_latency_score(candidate, in_flight);
         self.config.weight_quality * candidate.quality_score
-            + self.config.weight_latency * candidate.latency_score
+            + self.config.weight_latency * latency_score
             + self.config.weight_cost * candidate.cost_score
+    }
+
+    fn local_index(&self, model: &ModelId) -> Option<usize> {
+        self.config
+            .candidates
+            .iter()
+            .position(|candidate| candidate.local && &candidate.target == model)
     }
 
     fn passes(&self, candidate: &QlcCandidate, profile: &RequestProfile) -> bool {
@@ -144,29 +179,65 @@ impl Algorithm for Qlc {
 
     async fn route(self: Arc<Self>, driver: Driver, request: Request) -> Result<RoutingOutcome> {
         let profile = RequestProfile::of(&request.llm_request);
-        let mut ranked: Vec<&QlcCandidate> = self
+        // Requests that route at the same time all arrive before any model call starts.
+        // Count each one while it is routing so they see each other.
+        let mut admitted = Vec::new();
+        let mut routing = vec![0; self.config.candidates.len()];
+        for (index, candidate) in self.config.candidates.iter().enumerate() {
+            if candidate.local && self.passes(candidate, &profile) {
+                routing[index] = self.routing[index].fetch_add(1, Ordering::AcqRel);
+                admitted.push(index);
+            }
+        }
+        let _admissions = RoutingAdmissions {
+            qlc: self.as_ref(),
+            indices: admitted,
+        };
+        let in_flight: Vec<usize> = self
+            .in_flight
+            .iter()
+            .map(|count| count.load(Ordering::Acquire))
+            .collect();
+        let reserved: Vec<usize> = self
+            .reserved
+            .iter()
+            .map(|count| count.load(Ordering::Acquire))
+            .collect();
+        let concurrency: Vec<usize> = (0..self.config.candidates.len())
+            .map(|index| in_flight[index] + routing[index] + reserved[index])
+            .collect();
+        let mut ranked: Vec<(&QlcCandidate, usize, f64)> = self
             .config
             .candidates
             .iter()
-            .filter(|candidate| self.passes(candidate, &profile))
+            .enumerate()
+            .filter(|(_, candidate)| self.passes(candidate, &profile))
+            .map(|(index, candidate)| (candidate, index, self.score(candidate, concurrency[index])))
             .collect();
-        ranked.sort_by(|left, right| self.score(right).total_cmp(&self.score(left)));
+        ranked.sort_by(|left, right| right.2.total_cmp(&left.2));
 
-        let Some(selected) = ranked.first() else {
+        let Some(&(selected, selected_index, selected_score)) = ranked.first() else {
             return Err(LibsyError::AlgorithmError {
                 message: "qlc: no candidate passed the hard filters".to_string(),
             });
         };
+        // Keep the selection counted until its model call starts.
+        if self.config.candidates[selected_index].local {
+            self.reserved[selected_index].fetch_add(1, Ordering::AcqRel);
+        }
         let candidates: Vec<_> = self
             .config
             .candidates
             .iter()
-            .map(|candidate| {
+            .enumerate()
+            .map(|(index, candidate)| {
                 serde_json::json!({
                     "target": candidate.target.as_str(),
-                    "score": self.score(candidate),
+                    "score": self.score(candidate, concurrency[index]),
                     "quality_score": candidate.quality_score,
-                    "latency_score": candidate.latency_score,
+                    "latency_score": effective_latency_score(candidate, concurrency[index]),
+                    "base_latency_score": candidate.latency_score,
+                    "concurrency": concurrency[index],
                     "cost_score": candidate.cost_score,
                     "eligible": self.passes(candidate, &profile),
                 })
@@ -175,19 +246,72 @@ impl Algorithm for Qlc {
         driver.set_evidence(serde_json::json!({
             "source": "qlc",
             "selected": selected.target.as_str(),
-            "score": self.score(selected),
+            "score": selected_score,
             "candidates": candidates,
         }));
         let fallbacks = ranked
             .iter()
             .skip(1)
-            .map(|candidate| candidate.target.clone())
+            .map(|(candidate, _, _)| candidate.target.clone())
             .collect();
         Ok(RoutingOutcome::route_to(
             selected.target.clone(),
             fallbacks,
             request,
         ))
+    }
+
+    fn model_call_started(&self, model: &ModelId) {
+        if let Some(index) = self.local_index(model) {
+            // The request that selected this model reserved a slot. Move it to `in_flight`.
+            let _ = self.reserved[index].try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                count.checked_sub(1)
+            });
+            self.in_flight[index].fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    fn model_call_finished(&self, model: &ModelId) {
+        if let Some(index) = self.local_index(model) {
+            let _ =
+                self.in_flight[index].try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                    count.checked_sub(1)
+                });
+        }
+    }
+
+    fn release_selection(&self, model: &ModelId) {
+        if let Some(index) = self.local_index(model) {
+            let _ = self.reserved[index].try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                count.checked_sub(1)
+            });
+        }
+    }
+}
+
+/// Releases a route's temporary admission slots when the route finishes.
+struct RoutingAdmissions<'a> {
+    qlc: &'a Qlc,
+    indices: Vec<usize>,
+}
+
+impl Drop for RoutingAdmissions<'_> {
+    fn drop(&mut self) {
+        for &index in &self.indices {
+            self.qlc.routing[index].fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+}
+
+/// Each request already running on a local model lowers its latency score by this much.
+const CONCURRENCY_PENALTY: f64 = 0.05;
+
+/// The latency score a local candidate has while `in_flight` calls are running.
+fn effective_latency_score(candidate: &QlcCandidate, in_flight: usize) -> f64 {
+    if candidate.local {
+        (candidate.latency_score - CONCURRENCY_PENALTY * in_flight as f64).max(0.0)
+    } else {
+        candidate.latency_score
     }
 }
 
@@ -317,7 +441,11 @@ mod tests {
     }
 
     async fn outcome(qlc: Qlc, request: Request) -> Result<RoutingOutcome> {
-        let mut stream = Arc::new(qlc).run_stream(
+        outcome_of(Arc::new(qlc), request).await
+    }
+
+    async fn outcome_of(qlc: Arc<Qlc>, request: Request) -> Result<RoutingOutcome> {
+        let mut stream = qlc.run_stream(
             request,
             Arc::new(RuntimeModels::default()),
             State::default(),
@@ -328,6 +456,14 @@ mod tests {
             }
         }
         Err(LibsyError::MissingFinalResponse)
+    }
+
+    fn evidence(outcome: &RoutingOutcome) -> serde_json::Value {
+        outcome
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.evidence.clone())
+            .expect("qlc records evidence")
     }
 
     #[tokio::test]
@@ -368,6 +504,149 @@ mod tests {
         assert_eq!(evidence["candidates"][0]["eligible"], false);
         assert_eq!(evidence["candidates"][1]["target"], "best");
         assert_eq!(evidence["candidates"][1]["eligible"], true);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn local_concurrency_lowers_latency_score() -> Result<()> {
+        for (concurrency, expected) in [(0, 0.20), (1, 0.15), (2, 0.10), (4, 0.0)] {
+            let mut local = candidate("local");
+            local.local = true;
+            local.latency_score = 0.20;
+            let qlc = Arc::new(Qlc::new(config(vec![local]))?);
+            for _ in 0..concurrency {
+                qlc.model_call_started(&ModelId::from("local"));
+            }
+
+            let outcome = outcome_of(Arc::clone(&qlc), request()).await?;
+            let evidence = evidence(&outcome);
+            let candidate = &evidence["candidates"][0];
+            assert_eq!(candidate["concurrency"], concurrency);
+            assert_eq!(candidate["base_latency_score"], 0.20);
+            let actual = candidate["latency_score"].as_f64().expect("latency score");
+            assert!(
+                (actual - expected).abs() < 1e-9,
+                "{concurrency} concurrent calls: expected {expected}, got {actual}"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn concurrency_penalty_changes_the_selected_model() -> Result<()> {
+        let mut local = candidate("local");
+        local.local = true;
+        local.latency_score = 0.60;
+        let mut cloud = candidate("cloud");
+        cloud.latency_score = 0.30;
+        let qlc = Arc::new(Qlc::new(config(vec![local, cloud]))?);
+
+        let selected = outcome_of(Arc::clone(&qlc), request()).await?;
+        assert_eq!(selected.selected_model_id()?, "local");
+
+        for _ in 0..7 {
+            qlc.model_call_started(&ModelId::from("local"));
+        }
+        let selected = outcome_of(Arc::clone(&qlc), request()).await?;
+        assert_eq!(selected.selected_model_id()?, "cloud");
+        let evidence = evidence(&selected);
+        assert_eq!(evidence["candidates"][0]["concurrency"], 7);
+        assert_eq!(evidence["candidates"][1]["concurrency"], 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn finished_calls_free_their_concurrency_slot() -> Result<()> {
+        let mut local = candidate("local");
+        local.local = true;
+        let qlc = Arc::new(Qlc::new(config(vec![local]))?);
+        let model = ModelId::from("local");
+
+        // A finished call with no start never pushes the count below zero.
+        qlc.model_call_finished(&model);
+        qlc.model_call_started(&model);
+        qlc.model_call_started(&model);
+        qlc.model_call_finished(&model);
+
+        let outcome = outcome_of(Arc::clone(&qlc), request()).await?;
+        assert_eq!(evidence(&outcome)["candidates"][0]["concurrency"], 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn requests_routing_at_the_same_time_count_as_concurrent() -> Result<()> {
+        let mut local = candidate("local");
+        local.local = true;
+        local.latency_score = 0.20;
+        let qlc = Arc::new(Qlc::new(config(vec![local]))?);
+        // Another request is inside its route call right now.
+        qlc.routing[0].fetch_add(1, Ordering::AcqRel);
+
+        let outcome = outcome_of(Arc::clone(&qlc), request()).await?;
+        let candidate = &evidence(&outcome)["candidates"][0];
+        assert_eq!(candidate["concurrency"], 1);
+        let latency = candidate["latency_score"].as_f64().expect("latency score");
+        assert!(
+            (latency - 0.15).abs() < 1e-9,
+            "unexpected latency: {latency}"
+        );
+        // This route released its own admission; only the simulated one remains.
+        assert_eq!(qlc.routing[0].load(Ordering::Acquire), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn selection_reservation_counts_until_the_call_starts() -> Result<()> {
+        let mut local = candidate("local");
+        local.local = true;
+        let qlc = Arc::new(Qlc::new(config(vec![local]))?);
+        let model = ModelId::from("local");
+
+        // Routing reserves the selected local model.
+        let _ = outcome_of(Arc::clone(&qlc), request()).await?;
+        assert_eq!(qlc.reserved[0].load(Ordering::Acquire), 1);
+
+        // A route in the gap before the call starts sees the reservation.
+        let during = outcome_of(Arc::clone(&qlc), request()).await?;
+        assert_eq!(evidence(&during)["candidates"][0]["concurrency"], 1);
+
+        // Starting the call moves the reservation to the in-flight count.
+        qlc.model_call_started(&model);
+        assert_eq!(qlc.reserved[0].load(Ordering::Acquire), 1);
+        assert_eq!(qlc.in_flight[0].load(Ordering::Acquire), 1);
+
+        let after = outcome_of(Arc::clone(&qlc), request()).await?;
+        assert_eq!(evidence(&after)["candidates"][0]["concurrency"], 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn release_selection_drops_the_reservation() -> Result<()> {
+        let mut local = candidate("local");
+        local.local = true;
+        let qlc = Arc::new(Qlc::new(config(vec![local]))?);
+        let model = ModelId::from("local");
+
+        let _ = outcome_of(Arc::clone(&qlc), request()).await?;
+        assert_eq!(qlc.reserved[0].load(Ordering::Acquire), 1);
+        qlc.release_selection(&model);
+        assert_eq!(qlc.reserved[0].load(Ordering::Acquire), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn routing_admissions_are_released_when_no_candidate_passes() -> Result<()> {
+        let mut local = candidate("local");
+        local.local = true;
+        local.available = false;
+        let qlc = Arc::new(Qlc::new(config(vec![local]))?);
+
+        let error = outcome_of(Arc::clone(&qlc), request())
+            .await
+            .err()
+            .expect("all candidates were filtered");
+        assert!(error.to_string().contains("no candidate"));
+        assert_eq!(qlc.routing[0].load(Ordering::Acquire), 0);
         Ok(())
     }
 

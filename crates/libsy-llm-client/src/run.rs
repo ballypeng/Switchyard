@@ -69,9 +69,17 @@ pub async fn run(
     let outcome = match clients.stored_state_owner(&request) {
         Some(owner) => Ok(continue_on(owner, &algorithm_name, request)),
         None => {
+            let serve_algorithm = Arc::clone(&algorithm);
             drive(Arc::clone(&algorithm), request, models, {
                 let routing_observations = routing_observations.clone();
-                move |call| serve(routing_clients.clone(), call, routing_observations.clone())
+                move |call| {
+                    serve(
+                        routing_clients.clone(),
+                        call,
+                        Arc::clone(&serve_algorithm),
+                        routing_observations.clone(),
+                    )
+                }
             })
             .await
         }
@@ -109,7 +117,7 @@ pub async fn run(
         };
         call_first_available(
             &clients,
-            &algorithm_name,
+            &algorithm,
             &outcome.request,
             outcome.fallback_request.as_ref(),
             &outcome.candidate_requests,
@@ -205,10 +213,16 @@ pub async fn decide(
     let mut outcome = match clients.stored_state_owner(&request) {
         Some(owner) => continue_on(owner, algorithm.name(), request),
         None => {
-            drive(algorithm, request, models, move |call| {
-                serve(routing_clients.clone(), call, None)
+            let serve_algorithm = Arc::clone(&algorithm);
+            let outcome = drive(Arc::clone(&algorithm), request, models, move |call| {
+                serve(routing_clients.clone(), call, serve_algorithm.clone(), None)
             })
-            .await?
+            .await?;
+            // `decide` never starts the completion call, so release its reservation now.
+            if let Some(selected) = outcome.selected_model_ids.first() {
+                algorithm.release_selection(selected);
+            }
+            outcome
         }
     };
     let selected_model_id = outcome.selected_model_id()?.clone();
@@ -282,6 +296,7 @@ fn emit_routing_observations(
 async fn serve(
     clients: ClientRouter,
     call: Call,
+    algorithm: Arc<dyn Algorithm>,
     observations: Option<Arc<Mutex<Vec<RunObservation>>>>,
 ) -> Result<()> {
     let call = match call {
@@ -297,7 +312,6 @@ async fn serve(
     };
     let target = call.models.first().cloned().ok_or(LibsyError::NoTargets)?;
     let request = clients.prepare_routing_request(call.request.clone(), &target);
-    let algorithm = call.algorithm.clone();
     let candidates = call.models.len();
     call.respond(call_one(
         &clients,
@@ -315,7 +329,7 @@ async fn serve(
 /// Try candidates in order until one succeeds or a failure stops fallback.
 async fn call_first_available<'a>(
     clients: &ClientRouter,
-    algorithm: &str,
+    algorithm: &Arc<dyn Algorithm>,
     request: &'a Request,
     fallback_request: Option<&'a Request>,
     candidate_requests: &'a HashMap<ModelId, Request>,
@@ -392,8 +406,8 @@ impl CallPhase {
     name = "libsy.client_call",
     skip_all,
     fields(
-        algorithm = algorithm,
-        switchyard.algorithm = algorithm,
+        algorithm = algorithm.name(),
+        switchyard.algorithm = algorithm.name(),
         switchyard.candidate = index + 1,
         switchyard.candidate_count = count,
         switchyard.call_phase = phase.as_str(),
@@ -431,7 +445,7 @@ async fn call_one(
     clients: &ClientRouter,
     model_id: &ModelId,
     request: Request,
-    algorithm: &str,
+    algorithm: &Arc<dyn Algorithm>,
     observe: &(dyn Fn(ModelCallObservation) + Send + Sync),
     // index is for span log
     index: usize,
@@ -452,6 +466,7 @@ async fn call_one(
     // Resolved before the clock starts: picking the client is Switchyard's work, not
     // the provider's, so it belongs in the routing overhead.
     let client = clients.route(model_id);
+    let guard = ModelCallGuard::start(algorithm, model_id);
     let started = Instant::now();
     let mut routing_usage = None;
     let result = async {
@@ -475,7 +490,7 @@ async fn call_one(
     let result = if is_routing {
         result
     } else {
-        metrics::observe_routed_request(algorithm, model_id, Some(duration), result)
+        metrics::observe_routed_request(algorithm.name(), model_id, Some(duration), result)
     };
     observe(ModelCallObservation {
         selected_model: model_id.clone(),
@@ -488,7 +503,42 @@ async fn call_one(
             .map(|response| response.usage.clone())
             .or(routing_usage),
     });
-    result
+    result.map(|mut response| {
+        // A streaming call stays in flight while the caller reads the stream.
+        if !is_routing && let LlmResponse::Stream(chunks) = response.llm_response {
+            response.llm_response = LlmResponse::Stream(
+                chunks
+                    .map(move |item| {
+                        let _keep_alive = &guard;
+                        item
+                    })
+                    .boxed(),
+            );
+        }
+        response
+    })
+}
+
+/// Counts a model call as in flight until its response stream is dropped.
+struct ModelCallGuard {
+    algorithm: Arc<dyn Algorithm>,
+    model: ModelId,
+}
+
+impl ModelCallGuard {
+    fn start(algorithm: &Arc<dyn Algorithm>, model: &ModelId) -> Self {
+        algorithm.model_call_started(model);
+        Self {
+            algorithm: Arc::clone(algorithm),
+            model: model.clone(),
+        }
+    }
+}
+
+impl Drop for ModelCallGuard {
+    fn drop(&mut self) {
+        self.algorithm.model_call_finished(&self.model);
+    }
 }
 
 // Routing logs need the final usage, but replay must keep signed provider events intact.
@@ -1129,7 +1179,48 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use crate::{Backend, HttpBackendConfig, ModelConfig, TranslatingLlmClient};
+    use std::sync::atomic::Ordering;
     use switchyard_protocol::Category;
+
+    #[derive(Default)]
+    struct HookedAlgorithm {
+        started: std::sync::atomic::AtomicUsize,
+        finished: std::sync::atomic::AtomicUsize,
+        released: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Algorithm for HookedAlgorithm {
+        fn name(&self) -> &str {
+            "hooked_test"
+        }
+
+        async fn route(
+            self: Arc<Self>,
+            driver: Driver,
+            request: Request,
+        ) -> Result<RoutingOutcome> {
+            let models = driver.models_for(&Category::Any);
+            let selected_model = models.first().cloned().ok_or(LibsyError::NoTargets)?;
+            Ok(RoutingOutcome::route_to(
+                selected_model,
+                Vec::new(),
+                request,
+            ))
+        }
+
+        fn model_call_started(&self, _model: &ModelId) {
+            self.started.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn model_call_finished(&self, _model: &ModelId) {
+            self.finished.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn release_selection(&self, _model: &ModelId) {
+            self.released.fetch_add(1, Ordering::SeqCst);
+        }
+    }
 
     struct CandidateAlgorithm {}
 
@@ -1562,6 +1653,77 @@ mod tests {
         )
         .await;
         (client, result)
+    }
+
+    #[tokio::test]
+    async fn model_call_hooks_wrap_a_buffered_call() -> Result<()> {
+        let algorithm = Arc::new(HookedAlgorithm::default());
+        let client = Arc::new(CandidateClient {
+            calls: Mutex::new(Vec::new()),
+            requests: Mutex::new(Vec::new()),
+            first: FirstOutcome::StreamSuccess,
+        });
+
+        run(
+            algorithm.clone(),
+            ClientRouter::single(client),
+            request(),
+            to_category_map(&["strong"]),
+            None,
+        )
+        .await?;
+
+        assert_eq!(algorithm.started.load(Ordering::SeqCst), 1);
+        assert_eq!(algorithm.finished.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn model_call_hooks_end_when_the_stream_is_dropped() -> Result<()> {
+        let algorithm = Arc::new(HookedAlgorithm::default());
+        let client = Arc::new(CandidateClient {
+            calls: Mutex::new(Vec::new()),
+            requests: Mutex::new(Vec::new()),
+            first: FirstOutcome::StreamSuccess,
+        });
+
+        let (_, response) = run(
+            algorithm.clone(),
+            ClientRouter::single(client),
+            request(),
+            to_category_map(&["weak"]),
+            None,
+        )
+        .await?;
+
+        assert_eq!(algorithm.started.load(Ordering::SeqCst), 1);
+        assert_eq!(algorithm.finished.load(Ordering::SeqCst), 0);
+        drop(response);
+        assert_eq!(algorithm.finished.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn decide_releases_the_selection_without_a_completion_call() -> Result<()> {
+        let algorithm = Arc::new(HookedAlgorithm::default());
+        let client = Arc::new(CandidateClient {
+            calls: Mutex::new(Vec::new()),
+            requests: Mutex::new(Vec::new()),
+            first: FirstOutcome::StreamSuccess,
+        });
+
+        let outcome = decide(
+            algorithm.clone(),
+            ClientRouter::single(client),
+            request(),
+            to_category_map(&["weak"]),
+        )
+        .await?;
+
+        assert_eq!(outcome.selected_model_id()?, "weak");
+        assert_eq!(algorithm.started.load(Ordering::SeqCst), 0);
+        assert_eq!(algorithm.released.load(Ordering::SeqCst), 1);
+        Ok(())
     }
 
     fn to_category_map(names: &[&str]) -> Arc<RuntimeModels> {

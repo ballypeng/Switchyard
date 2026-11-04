@@ -92,17 +92,17 @@ type = "noop"
 [routes.qlc]
 id = "switchyard/qlc"
 type = "qlc"
-weight_quality = 0.5
-weight_latency = 0
-weight_cost = 0.5
+weight_quality = 0.4
+weight_latency = 0.4
+weight_cost = 0.2
 max_latency_ms = 60000
 require_local = false
 
 [[routes.qlc.candidates]]
 target = "capable"
 quality_score = 0.8
-latency_score = 0.75
-cost_score = 0.20
+latency_score = 1
+cost_score = 0
 estimated_latency_ms = 1800
 context_window = 128000
 vision = true
@@ -111,14 +111,14 @@ local = false
 
 [[routes.qlc.candidates]]
 target = "efficient"
-quality_score = 0.75
+quality_score = 0.7
 latency_score = 0.8
 cost_score = 1
 estimated_latency_ms = 900
 context_window = 128000
 vision = true
 tool_calling = true
-local = false
+local = true
 
 # [[routes.qlc.candidates]]
 # target = "local_qwen"

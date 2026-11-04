@@ -24,19 +24,19 @@ Score = W_q * Q_task + W_l * L_est + W_c * C_est
 ```
 
 - `Q_task`：任务质量分（越大越好，[0,1]）。
-- `L_est`：时延得分（越大越好，[0,1]；分数越高代表越快）。
+- `L_est`：时延得分（越大越好，[0,1]；分数越高代表越快）。本地候选会按当前并发数扣分。
 - `C_est`：成本得分（越大越好，[0,1]；分数越高代表越便宜）。
 - `W_q / W_l / W_c`：三个维度的权重，由配置文件给出。
 
 > 
-> 现状：`W_q`、`Q_task`、`W_l`、`L_est`、`W_c`、`C_est` 暂时全部通过配置文件显式配置，不依赖运行时统计。
+> `W_q`、`Q_task`、`W_c`、`C_est` 和基础 `L_est` 来自配置文件。本地候选的 `L_est` 还会减去当前并发请求带来的惩罚。
 
 ### 第三阶段：输出
 对通过硬过滤的候选按得分降序排序，选得分最高的模型路由；其余候选作为有序 fallback。
 
 ## 二、实现方案
 
-QLC 是一个新的路由类型 `type = "qlc"`。算法本体放在 `libsy`。`switchyard-runner` 负责解析 TOML、解析目标名并构造算法。所有分数和权重都来自配置文件，不读取运行时统计。
+QLC 是一个新的路由类型 `type = "qlc"`。算法本体放在 `libsy`。`switchyard-runner` 负责解析 TOML、解析目标名并构造算法。分数和权重来自配置文件。唯一读取的运行时状态是本地候选当前的并发请求数。
 
 ### 2.1 配置示例
 
@@ -134,12 +134,15 @@ local = true
    - 服务状态：`available = false` 的候选直接剔除。
 2. **软评分**
    ```
+   effective_latency_score = max(latency_score - 0.05 * 并发数, 0)   # 只用于 local = true
    score = weight_quality * quality_score
-         + weight_latency * latency_score
+         + weight_latency * effective_latency_score
          + weight_cost * cost_score
    ```
+   并发数包括三类请求：正在调用该模型的、已经选中该模型但调用尚未开始的、以及正在同时选路的。每多一个并发请求，时延得分减 0.05，最低为 0。云端候选的时延得分不变。流式响应在流关闭后才算结束。
 3. **输出**
    按得分降序排序。同分时保持配置顺序。第一名作为选中模型，其余按排序结果作为 fallback。
+   QLC 同时记录路由证据：每个候选的 `score`、实际使用的 `latency_score`、`base_latency_score`、`concurrency` 和 `eligible`。这些字段会写入路由日志。
 
 请求 token 数用粗估：把 `instructions`、`messages`、`tools` 序列化后的字符数除以 4，再加上 `max_output_tokens`。这个值只用于上下文窗口过滤。
 
@@ -155,13 +158,15 @@ local = true
 
 全部候选都被硬过滤时，本次请求返回错误，不退回被过滤的候选。QLC 不调用任何模型，只排序并返回路由结果。
 
-QLC 不读取运行时健康统计。服务状态由配置项 `available` 表达。把模型临时剔除，需要修改配置并重新加载。`max_latency_ms` 检查的是配置里的预估值，不是实测值。上下文长度也是粗估。这两项只用于选路，不会改变请求本身。
+QLC 只统计本地候选当前的并发请求数，不读取其他运行时健康统计。服务状态由配置项 `available` 表达。把模型临时剔除，需要修改配置并重新加载。`max_latency_ms` 检查的是配置里的预估值，不是实测值。上下文长度也是粗估。这两项只用于选路，不会改变请求本身。
 
 ### 2.4 主要改动点
 
 | 文件 | 改动 |
 |---|---|
-| `crates/libsy/src/algorithms/qlc.rs` | 新增 `Qlc`、`QlcConfig`、`QlcCandidate`，实现硬过滤、评分、排序和 fallback 列表。 |
+| `crates/libsy/src/algorithms/qlc.rs` | 新增 `Qlc`、`QlcConfig`、`QlcCandidate`，实现硬过滤、评分、排序、本地并发惩罚和 fallback 列表。 |
+| `crates/libsy/src/core/algorithm.rs` | `Algorithm` 新增 `model_call_started` 和 `model_call_finished` 钩子。 |
+| `crates/libsy-llm-client/src/run.rs` | 在真实模型调用期间上报开始和结束；流式调用在流关闭时结束。 |
 | `crates/libsy/src/algorithms.rs` | 注册 `qlc` 模块。 |
 | `crates/libsy/src/lib.rs` | 导出 QLC 类型。 |
 | `crates/switchyard-runner/src/algorithm.rs` | 新增 `AlgorithmSpec::Qlc` 和候选项配置；补充目标名校验、运行时模型分组和构造逻辑。 |
