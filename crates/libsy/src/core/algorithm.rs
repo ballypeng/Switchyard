@@ -815,6 +815,20 @@ pub trait Algorithm: Send + Sync + 'static {
     /// session's next request is routed with this answer already recorded.
     async fn observe_answer(&self, _session_id: &str, _answer: AnswerSummary) {}
 
+    /// Called when the host starts a model call.
+    ///
+    /// A streaming call stays active until its stream is dropped.
+    fn model_call_started(&self, _model: &ModelId) {}
+
+    /// Called when a model call started with [`Self::model_call_started`] ends.
+    fn model_call_finished(&self, _model: &ModelId) {}
+
+    /// Called when the host discards a routing outcome without starting the selected call.
+    ///
+    /// The caller may run the model outside this host. An algorithm can keep the
+    /// selection counted for an expected call duration instead of releasing it at once.
+    fn release_selection(&self, _model: &ModelId) {}
+
     /// Expose work requests and the final outcome so the host can control execution.
     ///
     /// Each call waits for its host reply. A run ends with one terminal item — [`Step::Done`] on

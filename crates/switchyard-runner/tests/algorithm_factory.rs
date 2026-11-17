@@ -123,6 +123,74 @@ async fn configured_parent_and_subagent_targets_stay_separate() {
     }
 }
 
+const QLC_DEPLOYMENT: &str = r#"
+schema_version = 1
+[llm_clients.answers]
+format = "openai_chat"
+base_url = "https://example.test/v1"
+[targets]
+fast = { id = "upstream/fast", llm_client = "answers" }
+capable = { id = "upstream/capable", llm_client = "answers" }
+[routes.qlc]
+id = "public/qlc"
+type = "qlc"
+weight_quality = 1.0
+weight_latency = 0.0
+weight_cost = 0.0
+
+[[routes.qlc.candidates]]
+target = "fast"
+quality_score = 0.4
+latency_score = 0.9
+cost_score = 0.9
+context_window = 1000
+
+[[routes.qlc.candidates]]
+target = "capable"
+quality_score = 0.9
+latency_score = 0.4
+cost_score = 0.2
+context_window = 1000
+"#;
+
+#[tokio::test]
+async fn qlc_route_builds_and_ranks_configured_targets() {
+    let mut algorithms = AlgorithmFactory::from_toml(QLC_DEPLOYMENT)
+        .expect("qlc deployment should parse")
+        .build()
+        .expect("qlc algorithm should build");
+    let (algorithm, models) = algorithms.remove("public/qlc").expect("public route id");
+    assert_eq!(algorithm.name(), "qlc");
+    assert_eq!(
+        models.models_for(&Category::Any),
+        [
+            ModelId::from("upstream/fast"),
+            ModelId::from("upstream/capable")
+        ]
+    );
+
+    let request = Request {
+        llm_request: text_request(Some("public/qlc".to_string()), "hello"),
+        ..Request::default()
+    };
+    let outcome = libsy::drive(
+        Arc::clone(&algorithm),
+        request,
+        Arc::new(models),
+        |_| async { panic!("qlc must not dispatch provider calls") },
+    )
+    .await
+    .expect("qlc route should resolve");
+
+    assert_eq!(
+        outcome.selected_model_ids,
+        [
+            ModelId::from("upstream/capable"),
+            ModelId::from("upstream/fast")
+        ]
+    );
+}
+
 #[test]
 fn invalid_routing_configuration_is_rejected() {
     for (source, expected) in [

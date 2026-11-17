@@ -15,9 +15,9 @@ use libsy::{
     CompositeRouter, CompositeRouterConfig, CustomClassifierConfig, CustomClassifierPolicy,
     DEFAULT_UNMATCHED_STEPS, DecisionJudgeConfig, DirectClassifierConfig, EscalationJudgeConfig,
     GateTrigger, HandoffNoteConfig, LlmCapabilityConfig, LlmClassifierConfig, LlmFallback,
-    LlmTaskClassifier, Noop, Passthrough, PickerMode, PlanExecute, PlanExecuteConfig, Random,
-    RuntimeModels, StageRouter, StageRouterConfig, SubagentRouter, SubagentRouterConfig,
-    TaskClassifierConfig, ToolSemantics, Vgr, VgrConfig,
+    LlmTaskClassifier, Noop, Passthrough, PickerMode, PlanExecute, PlanExecuteConfig, Qlc,
+    QlcCandidate, QlcConfig, Random, RuntimeModels, StageRouter, StageRouterConfig, SubagentRouter,
+    SubagentRouterConfig, TaskClassifierConfig, ToolSemantics, Vgr, VgrConfig,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -405,6 +405,38 @@ pub enum PlanExecuteTrigger {
     Judge,
 }
 
+/// One candidate in a `qlc` route.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QlcCandidateConfig {
+    /// Name of an entry in `[targets]`.
+    pub target: String,
+    /// Quality score from 0 to 1.
+    pub quality_score: f64,
+    /// Latency score from 0 to 1. Higher means faster.
+    pub latency_score: f64,
+    /// Cost score from 0 to 1. Higher means cheaper.
+    pub cost_score: f64,
+    /// Estimated latency in milliseconds. Required when the route sets `max_latency_ms`.
+    #[serde(default)]
+    pub estimated_latency_ms: Option<u64>,
+    /// Largest context the candidate supports. Unset places no limit.
+    #[serde(default)]
+    pub context_window: Option<u32>,
+    /// Whether the candidate accepts image input.
+    #[serde(default)]
+    pub vision: bool,
+    /// Whether the candidate supports tool calls.
+    #[serde(default)]
+    pub tool_calling: bool,
+    /// Whether the candidate satisfies a local-only deployment requirement.
+    #[serde(default)]
+    pub local: bool,
+    /// Whether the candidate is taking traffic. Defaults to true.
+    #[serde(default = "default_true")]
+    pub available: bool,
+}
+
 /// A routing algorithm described by configured target names. Converting it to `&str` gives
 /// the route's `type`, such as `stage_router`.
 #[derive(Clone, Debug, Deserialize, IntoStaticStr)]
@@ -421,6 +453,27 @@ pub enum AlgorithmSpec {
         weights: Option<Vec<f64>>,
         /// Makes the sequence of choices repeatable.
         seed: Option<u64>,
+    },
+    /// Filters candidates by hard requirements, then scores the rest by quality,
+    /// latency, and cost.
+    Qlc {
+        /// Weight for the quality score. Defaults to 1.
+        #[serde(default = "default_qlc_weight")]
+        weight_quality: f64,
+        /// Weight for the latency score. Defaults to 1.
+        #[serde(default = "default_qlc_weight")]
+        weight_latency: f64,
+        /// Weight for the cost score. Defaults to 1.
+        #[serde(default = "default_qlc_weight")]
+        weight_cost: f64,
+        /// Hard latency ceiling in milliseconds. Unset disables the ceiling.
+        #[serde(default)]
+        max_latency_ms: Option<u64>,
+        /// Restricts routing to candidates marked `local`.
+        #[serde(default)]
+        require_local: bool,
+        /// Candidate models and their configured values.
+        candidates: Vec<QlcCandidateConfig>,
     },
     /// Sends every request to one target.
     Passthrough {
@@ -920,6 +973,10 @@ impl AlgorithmSpec {
         match self {
             Self::Noop { .. } => Vec::new(),
             Self::Random { targets, .. } => targets.iter().map(String::as_str).collect(),
+            Self::Qlc { candidates, .. } => candidates
+                .iter()
+                .map(|candidate| candidate.target.as_str())
+                .collect(),
             Self::Passthrough {
                 target, subagents, ..
             } => {
@@ -1067,6 +1124,13 @@ impl AlgorithmSpec {
             Self::Random { targets, .. } | Self::PrefillRouter { targets, .. } => {
                 category_models([(Category::Any, targets.clone())])
             }
+            Self::Qlc { candidates, .. } => {
+                let names = candidates
+                    .iter()
+                    .map(|candidate| candidate.target.clone())
+                    .collect();
+                category_models([(Category::Any, names)])
+            }
             Self::Passthrough { target, .. } => {
                 category_models([(Category::Any, vec![target.clone()])])
             }
@@ -1198,6 +1262,7 @@ impl AlgorithmSpec {
             )),
             Self::Noop { .. }
             | Self::Random { .. }
+            | Self::Qlc { .. }
             | Self::Passthrough { .. }
             | Self::PlanExecute { .. }
             | Self::LlmClassifier { .. }
@@ -1741,6 +1806,44 @@ fn build_algorithm(
             })?;
             Ok(Arc::new(algorithm))
         }
+        AlgorithmSpec::Qlc {
+            weight_quality,
+            weight_latency,
+            weight_cost,
+            max_latency_ms,
+            require_local,
+            candidates,
+        } => {
+            let candidates = candidates
+                .iter()
+                .map(|candidate| {
+                    Ok(QlcCandidate {
+                        target: resolve_target_model_id(route_name, &candidate.target, targets)?,
+                        quality_score: candidate.quality_score,
+                        latency_score: candidate.latency_score,
+                        cost_score: candidate.cost_score,
+                        estimated_latency_ms: candidate.estimated_latency_ms,
+                        context_window: candidate.context_window,
+                        vision: candidate.vision,
+                        tool_calling: candidate.tool_calling,
+                        local: candidate.local,
+                        available: candidate.available,
+                    })
+                })
+                .collect::<AlgorithmResult<Vec<_>>>()?;
+            let algorithm = Qlc::new(QlcConfig {
+                candidates,
+                weight_quality: *weight_quality,
+                weight_latency: *weight_latency,
+                weight_cost: *weight_cost,
+                max_latency_ms: *max_latency_ms,
+                require_local: *require_local,
+            })
+            .map_err(|error| {
+                AlgorithmConfigError::with_source(format!("qlc route {route_name}: {error}"), error)
+            })?;
+            Ok(Arc::new(algorithm))
+        }
         AlgorithmSpec::Passthrough { subagents, .. } => {
             let algorithm = Passthrough;
             let parent: Arc<dyn Algorithm> = Arc::new(algorithm);
@@ -2198,6 +2301,10 @@ const fn default_vgr_deadline() -> f64 {
 
 const fn default_true() -> bool {
     true
+}
+
+const fn default_qlc_weight() -> f64 {
+    1.0
 }
 
 const fn default_vgr_breaker_threshold() -> u32 {

@@ -212,7 +212,8 @@ impl SharedRoutingLog {
         context: &routing_log::RoutingLogContext,
         metadata: libsy::OutcomeMetadata,
     ) {
-        if metadata.judgments.is_empty() {
+        // Skip outcomes that carry neither judge decisions nor algorithm evidence.
+        if metadata.judgments.is_empty() && metadata.evidence.is_none() {
             return;
         }
         if let Err(error) = self.writer.lock().append_outcome(context, metadata) {
@@ -1922,6 +1923,33 @@ targets = ["only"]
             serde_json::from_str(contents.lines().next().expect("call record"))?;
         assert_eq!(record["session_id"], "session-1");
         assert_eq!(record["turn_id"], "turn-1");
+        Ok(())
+    }
+
+    /// Algorithms such as QLC attach evidence without judge decisions, and that
+    /// evidence is still worth writing to the routing log.
+    #[test]
+    fn stats_observer_logs_outcome_evidence_without_judgments()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let log = SharedRoutingLog::new(dir.path().join("routing.jsonl")).expect("routing log");
+        let mut headers = HeaderMap::new();
+        headers.insert("x-switchyard-session-id", "session-1".parse()?);
+        let metadata = metadata_from_headers(headers);
+        let context = routing_log::RoutingLogContext::from_metadata(&metadata);
+        let observer = stats_observer(StatsAccumulator::default(), Some((log.clone(), context)));
+
+        observer(RunObservation::Outcome(libsy::OutcomeMetadata::new(
+            "qlc".into(),
+            Some(serde_json::json!({"source": "qlc", "selected": "model-a"})),
+        )));
+
+        let snapshot = log
+            .snapshot_session("session-1")
+            .expect("read log")
+            .expect("session recorded");
+        let snapshot = serde_json::to_value(&snapshot).expect("serializable snapshot");
+        assert_eq!(snapshot["outcomes"][0]["evidence"]["selected"], "model-a");
         Ok(())
     }
 

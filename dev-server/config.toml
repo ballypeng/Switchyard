@@ -4,8 +4,21 @@ schema_version = 1
 
 [llm_clients.inference_hub]
 format = "openai_responses"
-base_url = "https://inference-api.nvidia.com/v1"
+base_url = "http://113.46.219.251:8080/v1"
 api_key_env = "NVIDIA_API_KEY"
+
+# Local OpenAI-compatible servers. Change the host or port to match each server.
+[llm_clients.local_ollama]
+format = "openai_chat"
+base_url = "http://113.46.219.251:8080/v1"
+api_key_env = "NVIDIA_API_KEY"
+timeout_ms = 120000
+
+[llm_clients.local_vllm]
+format = "openai_chat"
+base_url = "http://113.46.219.251:8080/v1"
+api_key_env = "NVIDIA_API_KEY"
+timeout_ms = 120000
 
 [decision_clients.decisions]
 format = "openai_decisions"
@@ -13,17 +26,27 @@ endpoint = "https://inference-api.nvidia.com/v1/decisions"
 api_key_env = "NVIDIA_API_KEY"
 timeout_ms = 5000
 
-# The three models our algos use
+# Models our routes use: two cloud models and two local models.
 
 [targets.capable]
-id = "openai/openai/gpt-6.1-sol"
+id = "Qwen3.8-Flash"
 llm_client = "inference_hub"
 extra_body = { reasoning = { effort = "medium" } }
 
 [targets.efficient]
-id = "openai/openai/gpt-6-luna"
+id = "DeepSeek-V4.1-Flash-1017"
 llm_client = "inference_hub"
 extra_body = { reasoning = { effort = "medium" } }
+
+# Must match the name the local server reports. For Ollama, use `ollama list`.
+[targets.local_qwen]
+id = "qwen3.8-27b"
+llm_client = "local_ollama"
+
+# Must match vLLM's --served-model-name.
+[targets.local_llama]
+id = "GLM-5.3-Flash"
+llm_client = "local_vllm"
 
 [decision_targets.classifier]
 id = "openai/openai/gpt-6-luna"
@@ -65,6 +88,68 @@ target = "efficient"
 [routes.noop]
 id = "switchyard/noop"
 type = "noop"
+
+# QLC
+
+[routes.qlc]
+id = "switchyard/qlc"
+type = "qlc"
+weight_quality = 1
+weight_latency = 0
+weight_cost = 0
+# weight_quality = 0.5
+# weight_latency = 0
+# weight_cost = 0.5
+# weight_quality = 0.4
+# weight_latency = 0.4
+# weight_cost = 0.2
+max_latency_ms = 60000
+require_local = false
+
+# [[routes.qlc.candidates]]
+# target = "capable"
+# quality_score = 0.8
+# latency_score = 1
+# cost_score = 0
+# estimated_latency_ms = 1800
+# context_window = 128000
+# vision = true
+# tool_calling = true
+# local = false
+
+[[routes.qlc.candidates]]
+target = "efficient"
+quality_score = 0.8
+latency_score = 1
+cost_score = 0
+estimated_latency_ms = 1800
+context_window = 128000
+vision = true
+tool_calling = true
+local = false
+
+[[routes.qlc.candidates]]
+target = "local_qwen"
+# target = "local_llama"
+quality_score = 0.7
+latency_score = 0.8
+cost_score = 1
+estimated_latency_ms = 900
+context_window = 128000
+vision = true
+tool_calling = true
+local = true
+
+# [[routes.qlc.candidates]]
+# target = "local_llama"
+# quality_score = 0.85
+# latency_score = 0.50
+# cost_score = 1.00
+# estimated_latency_ms = 3500
+# context_window = 128000
+# vision = false
+# tool_calling = true
+# local = true
 
 # Stage
 

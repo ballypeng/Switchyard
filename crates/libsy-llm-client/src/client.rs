@@ -342,6 +342,8 @@ impl TranslatingLlmClient {
         // which keeps the caller's original `model`; force the resolved model so
         // the upstream always sees the target id.
         set_json_model(&mut body, model);
+        // These fields tune Switchyard routing. Providers do not accept them.
+        strip_routing_hint_fields(&mut body);
         if matches!(backend, Backend::OpenAiResponses(_)) {
             sanitize_openai_responses_provider_body(&mut body);
         }
@@ -1253,6 +1255,16 @@ fn ensure_responses_function_tool_description(object: &mut Map<String, Value>) {
 // `context_management` on every turn, so the Anthropic leg must strip it or the
 // upstream rejects the request (for example `clear_thinking_20251015` strategy
 // requires `thinking` to be enabled or adaptive).
+// Switchyard reads these QLC weights for routing. Upstream providers do not accept
+// unknown request fields, and preserved same-format bodies replay them verbatim.
+fn strip_routing_hint_fields(body: &mut Value) {
+    if let Value::Object(object) = body {
+        object.remove("weight_quality");
+        object.remove("weight_latency");
+        object.remove("weight_cost");
+    }
+}
+
 fn strip_anthropic_incompatible_fields(body: &mut Value) {
     if let Value::Object(object) = body {
         object.remove("reasoning_effort");
@@ -2825,6 +2837,53 @@ mod tests {
                 None,
                 Some(&ModelId::from("claude")),
                 WireFormat::AnthropicMessages,
+            )
+            .await?;
+        Ok(())
+    }
+
+    // QLC reads these fields for routing. Replaying them upstream would make
+    // providers that reject unknown fields refuse the whole request.
+    #[tokio::test]
+    async fn routing_weight_hints_are_not_sent_upstream()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(|request: &wiremock::Request| {
+                let body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
+                ["weight_quality", "weight_latency", "weight_cost"]
+                    .iter()
+                    .all(|key| body.get(key).is_none())
+            })
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "chatcmpl-1",
+                "model": "gpt",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            })))
+            .mount(&server)
+            .await;
+
+        let client = TranslatingLlmClient::new(&chat_map(&format!("{}/v1", server.uri())))?;
+        let raw = json!({
+            "model": "client-facing",
+            "messages": [{"role": "user", "content": "hi"}],
+            "weight_quality": 0.2,
+            "weight_latency": 0.3,
+            "weight_cost": 0.5,
+        });
+
+        client
+            .call_rewrite_model_raw(
+                raw,
+                None,
+                Some(&ModelId::from("gpt")),
+                WireFormat::OpenAiChat,
             )
             .await?;
         Ok(())

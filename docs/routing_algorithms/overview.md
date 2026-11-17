@@ -44,6 +44,7 @@ quality, follow the [tuning loop](../tuning/index.md).
 | [Verification-Gated](vgr_routing.md) | `vgr` | An efficient model drafts. Verified answers stay on the efficient tier, and everything else goes to the capable model. |
 | [Prefill](prefill_routing.md) | `prefill_router` | A classifier you train on the prompt's hidden states picks the target. Experimental: Switchyard supplies no checkpoint, exporter, or encoder assets. |
 | [Random](random_routing.md) | `random` | A fixed traffic split. |
+| [QLC](../qlc_router.md) | `qlc` | Configured quality, latency, and cost scores pick a target. |
 | [Fixed](#direct-model-routes) | `passthrough` | One target, no decision. |
 | [Sub-agent](subagent_routing.md) | `subagents` table | A separate policy for delegated sub-agent work on `passthrough`, `stage_router`, and `composite` routes. |
 
@@ -62,6 +63,7 @@ quality, follow the [tuning loop](../tuning/index.md).
 | `vgr` | Evidence about an efficient candidate | Verifier and judge calls | Per final answer | See [the page](vgr_routing.md) | Capable tier | Not benchmarked. Planned for 0.4.0. | [`examples/vgr-local-servers.toml`](../../examples/vgr-local-servers.toml) |
 | `prefill_router` | Hidden states of the prompt | Encoder inference, no provider call | Every request | Not required | Checkpoint output | Experimental. No checkpoint is supplied. | [Schema example](../reference/toml_schema.md#prefill_router) |
 | `random` | Weights | None | Every request | Not required | Not applicable | Utility | [Random Routing](random_routing.md) |
+| `qlc` | Configured scores, filtered by request facts | None | Every request | Not required | The request fails | Not benchmarked | [Schema](../reference/toml_schema.md#qlc) |
 | `passthrough` | Nothing | None | Never | Not required | Not applicable | Utility | [Schema](../reference/toml_schema.md#passthrough) |
 | `noop` | Nothing | None | Never | Not required | Not applicable | Smoke test | [Schema](../reference/toml_schema.md#noop) |
 

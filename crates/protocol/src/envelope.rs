@@ -12,9 +12,9 @@ use http::HeaderMap;
 pub struct Request {
     /// The normalized request an algorithm routes.
     pub llm_request: LlmRequest,
-    /// An optional whole request body retained by the host. libsy and the translation
-    /// codecs do not read it. Exact same-format codec replay instead uses
-    /// [`LlmRequest::preservation`].
+    /// An optional whole request body retained by the host. Routing algorithms may
+    /// read request-level settings such as QLC weights from it. Exact same-format
+    /// codec replay instead uses [`LlmRequest::preservation`].
     pub raw_request: Option<serde_json::Value>,
     /// Correlation metadata carried through the request.
     pub metadata: Option<Metadata>,
