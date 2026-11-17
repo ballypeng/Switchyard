@@ -15,6 +15,9 @@ use switchyard_server::{
 
 const DEFAULT_HOST: IpAddr = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
 const DEFAULT_PORT: u16 = 4000;
+const DEFAULT_RSI_EXECUTION_LOG: &str = "logs/rsi-execution.jsonl";
+const DEFAULT_RSI_ROUTING_LOG: &str = "logs/rsi-routing.jsonl";
+const DEFAULT_RSI_RECOGNIZER_LOG: &str = "logs/rsi-recognizer.jsonl";
 
 /// Command-line arguments accepted by the Rust server binary.
 #[derive(Debug, Parser)]
@@ -53,8 +56,23 @@ pub(crate) struct ServerArgs {
     routing_log_file: Option<PathBuf>,
 
     /// This optional TOML or JSON file replaces the entire bundled table of rates in USD per million tokens.
-    #[arg(long, value_name = "PATH", requires = "routing_log_file")]
+    #[arg(long, value_name = "PATH")]
     pricing_file: Option<PathBuf>,
+
+    /// Append RSI execution records (context and model response) to this JSONL file.
+    /// Defaults to `logs/rsi-execution.jsonl`.
+    #[arg(long, value_name = "PATH")]
+    trajectory_log_file: Option<PathBuf>,
+
+    /// Append RSI recognizer input and output to this JSONL file.
+    /// Defaults to `logs/rsi-recognizer.jsonl`.
+    #[arg(long, value_name = "PATH")]
+    rsi_recognizer_log_file: Option<PathBuf>,
+
+    /// Append RSI routing decisions to this JSONL file.
+    /// Defaults to `logs/rsi-routing.jsonl`.
+    #[arg(long, value_name = "PATH")]
+    rsi_routing_log_file: Option<PathBuf>,
 
     /// TLS certificate path in PEM format.
     #[arg(long, requires = "tls_key")]
@@ -63,6 +81,10 @@ pub(crate) struct ServerArgs {
     /// TLS private-key path in PEM format.
     #[arg(long, requires = "tls_cert")]
     tls_key: Option<PathBuf>,
+}
+
+fn log_path(explicit: Option<PathBuf>, default: &str, dry_run: bool) -> Option<PathBuf> {
+    explicit.or_else(|| (!dry_run).then(|| PathBuf::from(default)))
 }
 
 impl ServerArgs {
@@ -78,6 +100,27 @@ impl ServerArgs {
         }
         if let Some(path) = self.pricing_file {
             state = state.with_pricing_file(path)?;
+        }
+        if let Some(path) = log_path(
+            self.trajectory_log_file,
+            DEFAULT_RSI_EXECUTION_LOG,
+            self.dry_run,
+        ) {
+            state = state.with_trajectory_log(path)?;
+        }
+        if let Some(path) = log_path(
+            self.rsi_recognizer_log_file,
+            DEFAULT_RSI_RECOGNIZER_LOG,
+            self.dry_run,
+        ) {
+            state = state.with_recognizer_log(path)?;
+        }
+        if let Some(path) = log_path(
+            self.rsi_routing_log_file,
+            DEFAULT_RSI_ROUTING_LOG,
+            self.dry_run,
+        ) {
+            state = state.with_routing_step_log(path)?;
         }
         let tls = match (self.tls_cert, self.tls_key) {
             (Some(cert), Some(key)) => {
@@ -107,4 +150,23 @@ impl ServerArgs {
 pub(crate) async fn run(args: ServerArgs) -> ServerResult<()> {
     let (state, options) = args.into_runtime()?;
     run_server(state, options).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicit_log_path_wins_and_defaults_apply_outside_dry_run() {
+        let explicit = PathBuf::from("custom.jsonl");
+        assert_eq!(
+            log_path(Some(explicit.clone()), "default.jsonl", false),
+            Some(explicit.clone())
+        );
+        assert_eq!(
+            log_path(None, "default.jsonl", false),
+            Some(PathBuf::from("default.jsonl"))
+        );
+        assert_eq!(log_path(None, "default.jsonl", true), None);
+    }
 }

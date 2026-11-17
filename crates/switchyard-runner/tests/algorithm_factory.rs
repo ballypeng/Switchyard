@@ -123,6 +123,140 @@ async fn configured_parent_and_subagent_targets_stay_separate() {
     }
 }
 
+const RSI_DEPLOYMENT: &str = r#"
+schema_version = 1
+[llm_clients.answers]
+format = "openai_chat"
+base_url = "https://example.test/v1"
+api_key_env = "SWITCHYARD_FACTORY_TEST_KEY_THAT_IS_NOT_SET"
+[targets]
+recognizer = { id = "upstream/recognizer", llm_client = "answers" }
+flagship = { id = "upstream/flagship", llm_client = "answers" }
+cheap = { id = "upstream/cheap", llm_client = "answers" }
+mid = { id = "upstream/mid", llm_client = "answers" }
+[routes.rsi]
+id = "public/rsi"
+type = "rsi_router"
+recognizer_target = "recognizer"
+flagship_target = "flagship"
+candidate_targets = ["cheap", "mid"]
+redis_url_env = "SWITCHYARD_RSI_TEST_REDIS_URL"
+"#;
+
+const RSI_REDIS_ENV: &str = "SWITCHYARD_RSI_TEST_REDIS_URL";
+static RSI_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn lock_rsi_env() -> std::sync::MutexGuard<'static, ()> {
+    RSI_ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[test]
+fn rsi_deployment_builds_from_configured_targets() {
+    let _env = lock_rsi_env();
+    // The test owns this variable name, so no other test reads it.
+    unsafe {
+        std::env::set_var(RSI_REDIS_ENV, "redis://127.0.0.1:6379");
+    }
+    let factory = AlgorithmFactory::from_toml(RSI_DEPLOYMENT).expect("deployment should parse");
+    let algorithms = factory.build().expect("rsi route should build");
+    let (algorithm, models) = &algorithms["public/rsi"];
+    assert_eq!(algorithm.name(), "rsi_router");
+    assert_eq!(
+        models.models_for(&Category::Judge),
+        [ModelId::from("upstream/recognizer")]
+    );
+    assert_eq!(
+        models.models_for(&Category::Capable),
+        [ModelId::from("upstream/flagship")]
+    );
+    assert_eq!(
+        models.models_for(&Category::Any),
+        [
+            ModelId::from("upstream/flagship"),
+            ModelId::from("upstream/cheap"),
+            ModelId::from("upstream/mid"),
+        ]
+    );
+
+    let routes = switchyard_runner::route_targets(RSI_DEPLOYMENT).expect("route targets");
+    let route = routes.first().expect("route");
+    assert_eq!(route.kind, "rsi_router");
+    assert_eq!(
+        route
+            .answer_targets
+            .iter()
+            .map(|target| target.name.as_str())
+            .collect::<Vec<_>>(),
+        ["flagship", "cheap", "mid"]
+    );
+    assert_eq!(
+        route
+            .judge_targets
+            .iter()
+            .map(|target| target.name.as_str())
+            .collect::<Vec<_>>(),
+        ["recognizer"]
+    );
+    unsafe {
+        std::env::remove_var(RSI_REDIS_ENV);
+    }
+}
+
+#[test]
+fn rsi_deployment_builds_without_redis_url() {
+    let _env = lock_rsi_env();
+    unsafe {
+        std::env::remove_var(RSI_REDIS_ENV);
+    }
+    let factory = AlgorithmFactory::from_toml(RSI_DEPLOYMENT).expect("deployment should parse");
+    let algorithms = factory
+        .build()
+        .expect("rsi route should build without Redis");
+    assert_eq!(algorithms["public/rsi"].0.name(), "rsi_router");
+}
+
+#[test]
+fn invalid_rsi_configuration_is_rejected() {
+    let _env = lock_rsi_env();
+    unsafe {
+        std::env::set_var(RSI_REDIS_ENV, "redis://127.0.0.1:6379");
+    }
+    for (source, expected) in [
+        (
+            RSI_DEPLOYMENT.replace(
+                "candidate_targets = [\"cheap\", \"mid\"]",
+                "candidate_targets = []",
+            ),
+            "candidate_targets must not be empty",
+        ),
+        (
+            RSI_DEPLOYMENT.replace(
+                "candidate_targets = [\"cheap\", \"mid\"]",
+                "candidate_targets = [\"cheap\", \"cheap\"]",
+            ),
+            "candidate target cheap is repeated",
+        ),
+        (
+            RSI_DEPLOYMENT.replace(
+                "recognizer_target = \"recognizer\"",
+                "recognizer_target = \"missing\"",
+            ),
+            "unknown target missing",
+        ),
+    ] {
+        let error = AlgorithmFactory::from_toml(&source)
+            .and_then(|factory| factory.build())
+            .err()
+            .expect("invalid rsi deployment should fail");
+        assert!(error.to_string().contains(expected), "{error}");
+    }
+    unsafe {
+        std::env::remove_var(RSI_REDIS_ENV);
+    }
+}
+
 #[test]
 fn invalid_routing_configuration_is_rejected() {
     for (source, expected) in [

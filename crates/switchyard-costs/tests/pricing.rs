@@ -184,6 +184,19 @@ fn bundled_aliases_keep_all_cache_rates() -> TestResult {
 }
 
 #[test]
+fn configured_model_aliases_are_priced() -> TestResult {
+    let prices = Pricing::bundled()?;
+    for model in [
+        "qwen3.8-Flash",
+        "DeepSeek-V4.1-Flash-1017",
+        "openai/openai/gpt-6-luna",
+    ] {
+        assert!(prices.contains(model), "missing pricing alias {model}");
+    }
+    Ok(())
+}
+
+#[test]
 fn bundled_provider_prices_and_optional_rates_stay_distinct() -> TestResult {
     let prices = Pricing::bundled()?;
     let mut usage = Usage {

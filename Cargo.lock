@@ -2165,6 +2165,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3c54fcab019b409d04215d3a17cb438fd7fbf192ee61461f20f4fe18704bc138"
 dependencies = [
  "aws-lc-rs",
+ "log",
  "once_cell",
  "rustls-pki-types",
  "rustls-webpki",
@@ -2680,6 +2681,7 @@ dependencies = [
  "futures-util",
  "prefill-router",
  "reqwest",
+ "rustls-native-certs",
  "serde",
  "serde_json",
  "strum_macros",
@@ -2688,6 +2690,7 @@ dependencies = [
  "switchyard-protocol",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-rustls",
  "toml 1.1.3+spec-1.1.0",
  "tracing",
  "wiremock",
@@ -2728,6 +2731,7 @@ dependencies = [
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

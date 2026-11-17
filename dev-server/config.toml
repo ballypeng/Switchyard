@@ -3,8 +3,10 @@ schema_version = 1
 # Clients
 
 [llm_clients.inference_hub]
-format = "openai_responses"
-base_url = "https://inference-api.nvidia.com/v1"
+format = "openai_chat"
+# format = "anthropic_messages"
+# base_url = "http://113.46.219.251/"
+base_url = "http://localhost:25947/proxy"
 api_key_env = "NVIDIA_API_KEY"
 
 [decision_clients.decisions]
@@ -16,35 +18,40 @@ timeout_ms = 5000
 # The three models our algos use
 
 [targets.capable]
-id = "openai/openai/gpt-6.1-sol"
+id = "DeepSeek-V4.1-Flash-1017"
 llm_client = "inference_hub"
-extra_body = { reasoning = { effort = "medium" } }
+# extra_body = { reasoning = { effort = "medium" } }
 
 [targets.efficient]
-id = "openai/openai/gpt-6-luna"
+id = "GLM-5.3-Flash"
 llm_client = "inference_hub"
-extra_body = { reasoning = { effort = "medium" } }
+# extra_body = { reasoning = { effort = "medium" } }
+
+[targets.recognizer]
+id = "Qwen3.8-Flash"
+llm_client = "inference_hub"
+# extra_body = { reasoning = { effort = "medium" } }
 
 [decision_targets.classifier]
 id = "openai/openai/gpt-6-luna"
 decision_client = "decisions"
 
-# Best route
-[routes.auto]
-id = "switchyard/auto"
+# Composite route, kept for comparison with the default RSI route.
+[routes.composite]
+id = "switchyard/composite"
 type = "composite"
 
-[routes.auto.classifier]
+[routes.composite.classifier]
 target = "classifier"
 classify_trigger = "user_turn"
 fail_open = false
 
-[routes.auto.classifier.decision]
+[routes.composite.classifier.decision]
 cutoff = 0.4
 candidates = { a = "capable", b = "efficient" }
 evidence = { description = "Candidate a is the larger reasoning-oriented coding and thinking model. It is intended for complex problems. Candidate b is the smaller fast coding model. It is intended for simple questions, simple local reads and edits, routine tests and straightforward fixes. These are qualitative deployment roles, not empirical success rates." }
 
-[routes.auto.stage]
+[routes.composite.stage]
 capable_target = "capable"
 efficient_target = "efficient"
 efficient_first_threshold = 0.5
@@ -117,4 +124,53 @@ gate_min_tool_results = 3
 id = "codex-auto-review"
 type = "passthrough"
 target = "efficient"
+
+# Default route: RSI router
+#
+# It reads a Redis URL from RSI_REDIS_URL. The server reads the whole subtask
+# catalog from Redis before each recognition, includes every subtask's ID, name,
+# and definition in the recognizer prompt, and sends the step to the cheapest
+# candidate of the selected subtask. If the variable is unset, the URL is
+# invalid, or a read fails, the route uses the flagship model and keeps serving.
+#
+# The catalog is one JSON array at Redis key `rsi:subtasks` (change it with
+# redis_catalog_key). Example:
+# [
+#   {
+#     "subtask_id": "edit-code",
+#     "subtask_name": "Edit code",
+#     "definition": "Change existing source files in a small, focused patch.",
+#     "candidates": [
+#       {"model_id": "openai/openai/gpt-6-luna", "cost_per_million_tokens": 0.6},
+#       {"model_id": "DeepSeek-V4.1-Flash-1017", "cost_per_million_tokens": 2.0}
+#     ],
+#     "skill": {
+#       "version": "v1",
+#       "template": "Read the nearby tests before editing."
+#     }
+#   }
+# ]
+
+[routes.auto]
+id = "switchyard/auto"
+type = "rsi_router"
+recognizer_target = "recognizer" # 小模型 S
+flagship_target = "capable" # 兜底模型
+candidate_targets = ["capable", "efficient"] # 执行模型池
+redis_url_env = "RSI_REDIS_URL"
+confidence_threshold = 0.7
+history_steps = 5
+selection = "lowest_cost"
+
+# Explicit alias for clients that still send switchyard/rsi.
+[routes.rsi]
+id = "switchyard/rsi"
+type = "rsi_router"
+recognizer_target = "recognizer"
+flagship_target = "capable"
+candidate_targets = ["capable", "efficient"]
+redis_url_env = "RSI_REDIS_URL"
+confidence_threshold = 0.7
+history_steps = 5
+selection = "lowest_cost"
 

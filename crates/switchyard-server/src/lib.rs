@@ -11,6 +11,7 @@ mod observed_translation;
 mod redaction;
 mod response;
 mod routing_log;
+mod rsi_trace;
 mod shutdown;
 mod sse;
 mod stats;
@@ -30,7 +31,7 @@ use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::extract::rejection::{JsonRejection, QueryRejection};
-use axum::extract::{DefaultBodyLimit, Query, Request as HttpRequest, State};
+use axum::extract::{DefaultBodyLimit, Path as AxumPath, Query, Request as HttpRequest, State};
 use axum::http::header::CONTENT_TYPE;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::middleware::Next;
@@ -43,7 +44,10 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use switchyard_llm_client::{AuxiliaryOperation, RunObservation, RunObserver};
-use switchyard_protocol::{LlmClientError, Metadata, ModelId, ProviderExtensions, Request, Usage};
+use switchyard_protocol::{
+    AggLlmResponse, InstructionBlock, LlmClientError, Message, Metadata, ModelId,
+    ProviderExtensions, Request, Tool, Usage,
+};
 use switchyard_runner::{
     CallerAuthKind, DecisionTarget, ModelCapabilities, Route, RunOutput, Runner, RunnerError,
 };
@@ -68,6 +72,8 @@ pub const DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 pub const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 32 * 1024 * 1024;
 
 const HEADER_SELECTED_MODEL: &str = "x-model-router-selected-model";
+/// Route ID that model discovery advertises as the default when it exists.
+const DEFAULT_ROUTE_MODEL: &str = "switchyard/auto";
 const FORWARDED_UPSTREAM_HEADERS: &[&str] = &[
     "baggage",
     "openai-processing-ms",
@@ -170,6 +176,10 @@ pub struct ServerState {
     metrics: prometheus::Registry,
     stats: StatsAccumulator,
     routing_log: Option<SharedRoutingLog>,
+    trajectory_log: Option<rsi_trace::SharedTrajectoryLog>,
+    routing_step_log: Option<rsi_trace::SharedRoutingStepLog>,
+    recognizer_log: Option<rsi_trace::SharedRecognizerLog>,
+    pricing: switchyard_costs::Pricing,
     track_cache_eligibility: bool,
     model_catalog: Arc<tokio::sync::Mutex<Option<(Instant, Value)>>>,
 }
@@ -241,6 +251,10 @@ impl ServerState {
             metrics,
             stats,
             routing_log: None,
+            trajectory_log: None,
+            routing_step_log: None,
+            recognizer_log: None,
+            pricing: switchyard_costs::Pricing::bundled().map_err(ServerError::new)?,
             track_cache_eligibility: tracking_enabled_from_env(),
             model_catalog: Arc::default(),
         })
@@ -252,14 +266,31 @@ impl ServerState {
         Ok(self)
     }
 
+    /// Enables durable RSI session and step records at `path`.
+    pub fn with_trajectory_log(mut self, path: impl Into<PathBuf>) -> ServerResult<Self> {
+        self.trajectory_log = Some(rsi_trace::SharedTrajectoryLog::new(path)?);
+        Ok(self)
+    }
+
+    /// Enables the RSI recognizer interaction log at `path`.
+    pub fn with_recognizer_log(mut self, path: impl Into<PathBuf>) -> ServerResult<Self> {
+        self.recognizer_log = Some(rsi_trace::SharedRecognizerLog::new(path)?);
+        Ok(self)
+    }
+
+    /// Enables the RSI routing decision log at `path`.
+    pub fn with_routing_step_log(mut self, path: impl Into<PathBuf>) -> ServerResult<Self> {
+        self.routing_step_log = Some(rsi_trace::SharedRoutingStepLog::new(path)?);
+        Ok(self)
+    }
+
     /// This method loads rates in USD per million tokens for saved routing records.
-    pub fn with_pricing_file(self, path: impl AsRef<std::path::Path>) -> ServerResult<Self> {
+    pub fn with_pricing_file(mut self, path: impl AsRef<std::path::Path>) -> ServerResult<Self> {
         let prices = switchyard_costs::Pricing::load(path.as_ref()).map_err(ServerError::new)?;
-        let log = self
-            .routing_log
-            .as_ref()
-            .ok_or_else(|| ServerError::new("pricing requires a routing log"))?;
-        log.writer.lock().pricing = prices;
+        if let Some(log) = &self.routing_log {
+            log.writer.lock().pricing = prices.clone();
+        }
+        self.pricing = prices;
         Ok(self)
     }
 
@@ -276,8 +307,14 @@ impl ServerState {
             .map(|kind| kind.as_str())
     }
 
-    fn route_for_model(&self, model: &str) -> Option<&Route> {
-        self.runner.route(model)
+    /// Resolves the route and public model ID for a requested model.
+    ///
+    /// A missing model, or one that names no configured route, falls back to
+    /// the default route, which uses the RSI algorithm.
+    fn route_for_model(&self, model: Option<&str>) -> Option<(&ModelId, &Route)> {
+        model
+            .and_then(|model| self.runner.route_entry(model))
+            .or_else(|| self.runner.default_route())
     }
 
     fn decision_response(
@@ -456,6 +493,208 @@ struct RequestStart(Instant);
 /// Routing-log marker distinguishing classifier and judge calls from answer calls.
 const CLASSIFIER_TIER: &str = "classifier";
 
+/// Request context and routing evidence for one RSI step.
+struct TrajectoryRecorder {
+    log: Option<rsi_trace::SharedTrajectoryLog>,
+    routing_step_log: Option<rsi_trace::SharedRoutingStepLog>,
+    recognizer_log: Option<rsi_trace::SharedRecognizerLog>,
+    pricing: switchyard_costs::Pricing,
+    request_id: String,
+    session_id: Option<String>,
+    route_id: String,
+    step: u64,
+    messages: Vec<Message>,
+    instructions: Vec<InstructionBlock>,
+    tools: Vec<Tool>,
+    outcome: Arc<Mutex<Option<libsy::OutcomeMetadata>>>,
+    selected_model: Option<ModelId>,
+    served_model: Option<ModelId>,
+}
+
+impl TrajectoryRecorder {
+    /// Whether the execution log needs the model output.
+    fn captures_output(&self) -> bool {
+        self.log.is_some()
+    }
+
+    /// Writes the recognizer interaction as soon as routing finishes.
+    fn write_recognizer(&mut self) {
+        let Some(recognizer_log) = self.recognizer_log.take() else {
+            return;
+        };
+        let evidence = self
+            .outcome
+            .lock()
+            .clone()
+            .and_then(|metadata| metadata.evidence);
+        if let Some(record) = rsi_trace::recognizer_record(
+            &self.request_id,
+            self.session_id.as_deref(),
+            self.step,
+            &self.route_id,
+            evidence.as_ref(),
+        ) {
+            recognizer_log.append(&record);
+        }
+    }
+
+    fn finish(
+        mut self,
+        usage: Option<&Usage>,
+        output: Option<&AggLlmResponse>,
+        latency: Duration,
+        result: rsi_trace::StepResult,
+    ) {
+        self.write_recognizer();
+        let evidence = self
+            .outcome
+            .lock()
+            .clone()
+            .and_then(|metadata| metadata.evidence);
+        let field = |name: &str| evidence.as_ref().and_then(|value| value.get(name));
+        let subtask_id = field("subtask_id")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let confidence = field("confidence").and_then(Value::as_f64);
+        let decision = field("decision")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let reason = field("reason").and_then(Value::as_str).map(str::to_string);
+        let skill_version = field("skill_version")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let served_model = self
+            .served_model
+            .as_deref()
+            .or(self.selected_model.as_deref());
+        let cost = match (served_model, usage) {
+            (Some(model), Some(usage)) => self.pricing.cost(model, usage),
+            _ => None,
+        };
+        let (cost_usd, cost_source) = match cost {
+            Some(cost) => (
+                Some(cost.usd),
+                Some(rsi_trace::cost_source(cost.source).to_string()),
+            ),
+            None => (None, None),
+        };
+        let response = output.and_then(execution_response);
+        let latency_ms = latency.as_secs_f64() * 1_000.0;
+        if let Some(log) = self.routing_step_log.as_ref() {
+            log.append(&rsi_trace::RoutingStep {
+                schema_version: rsi_trace::SCHEMA_VERSION,
+                request_id: self.request_id.clone(),
+                session_id: self.session_id.clone(),
+                step: self.step,
+                ts: rsi_trace::timestamp(),
+                route_id: self.route_id.clone(),
+                algorithm: "rsi_router".to_string(),
+                decision: decision.clone(),
+                reason: reason.clone(),
+                subtask_id: subtask_id.clone(),
+                confidence,
+                skill_version: skill_version.clone(),
+                selected_model: self.selected_model.as_ref().map(ToString::to_string),
+                served_model: self.served_model.as_ref().map(ToString::to_string),
+                result: result.clone(),
+                usage: usage.map(rsi_trace::StepUsage::from),
+                cost_usd,
+                cost_source: cost_source.clone(),
+                latency_ms: Some(latency_ms),
+            });
+        }
+        if let Some(log) = self.log.as_ref() {
+            log.append(&rsi_trace::TrajectoryStep {
+                schema_version: rsi_trace::SCHEMA_VERSION,
+                request_id: self.request_id.clone(),
+                session_id: self.session_id.clone(),
+                step: self.step,
+                ts: rsi_trace::timestamp(),
+                route_id: self.route_id.clone(),
+                algorithm: "rsi_router".to_string(),
+                subtask_id,
+                confidence,
+                decision,
+                reason,
+                skill_version,
+                selected_model: self.selected_model.as_ref().map(ToString::to_string),
+                served_model: self.served_model.as_ref().map(ToString::to_string),
+                result,
+                usage: usage.map(rsi_trace::StepUsage::from),
+                cost_usd,
+                cost_source,
+                latency_ms: Some(latency_ms),
+                messages: self.messages,
+                instructions: self.instructions,
+                tools: self.tools,
+                response,
+            });
+        }
+    }
+}
+
+/// Serializes a model response for the execution log without its preserved
+/// provider body.
+///
+/// Preservation repeats the response text and reasoning in the provider's
+/// original shape. The log records the normalized response, and no reader
+/// replays the log, so the copy only inflates each record.
+fn execution_response(output: &AggLlmResponse) -> Option<Value> {
+    let mut value = serde_json::to_value(output).ok()?;
+    value.as_object_mut()?.remove("preservation");
+    Some(value)
+}
+
+fn trace_capture(
+    state: &ServerState,
+    route: &Route,
+    request: &Request,
+) -> Option<TrajectoryRecorder> {
+    if route.algorithm_name() != "rsi_router" {
+        return None;
+    }
+    let log = state.trajectory_log.clone();
+    let routing_step_log = state.routing_step_log.clone();
+    let recognizer_log = state.recognizer_log.clone();
+    if log.is_none() && routing_step_log.is_none() && recognizer_log.is_none() {
+        return None;
+    }
+    let session_id = request
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.session_id.clone())
+        .filter(|session_id| !session_id.is_empty());
+    Some(TrajectoryRecorder {
+        log,
+        routing_step_log,
+        recognizer_log,
+        pricing: state.pricing.clone(),
+        request_id: uuid::Uuid::now_v7().to_string(),
+        session_id,
+        route_id: request.llm_request.model.clone().unwrap_or_default(),
+        step: rsi_trace::step_number(&request.llm_request.messages),
+        messages: request.llm_request.messages.clone(),
+        instructions: request.llm_request.instructions.clone(),
+        tools: request.llm_request.tools.clone(),
+        outcome: Arc::new(Mutex::new(None)),
+        selected_model: None,
+        served_model: None,
+    })
+}
+
+fn with_trace_outcome(base: RunObserver, trace: Option<&TrajectoryRecorder>) -> RunObserver {
+    let Some(trace) = trace else {
+        return base;
+    };
+    let outcome = Arc::clone(&trace.outcome);
+    Arc::new(move |observation| {
+        if let RunObservation::Outcome(metadata) = &observation {
+            *outcome.lock() = Some(metadata.clone());
+        }
+        base(observation);
+    })
+}
+
 /// This observer updates backend stats and records classifier and judge calls.
 ///
 /// The routing log also records failed answer calls with unknown cost. Successful
@@ -549,6 +788,17 @@ pub fn build_switchyard_router(state: ServerState) -> Router {
         .route("/health", get(health));
     if state.routing_log.is_some() {
         router = router.route("/v1/routing/session-stats", get(get_session_stats));
+    }
+    if state.trajectory_log.is_some() {
+        router = router
+            .route(
+                "/v1/rsi/sessions/{session_id}/steps",
+                get(get_rsi_session_steps),
+            )
+            .route(
+                "/v1/rsi/sessions/{session_id}/steps/{step}",
+                get(get_rsi_session_step),
+            );
     }
     finish_router(router.fallback(proxy_unmatched), state)
 }
@@ -939,7 +1189,10 @@ async fn handle_endpoint_inner(
     body: std::result::Result<Json<Value>, JsonRejection>,
     wire_format: WireFormat,
 ) -> Response {
-    let metadata = metadata_from_headers(headers);
+    let mut metadata = metadata_from_headers(headers);
+    if metadata.session_id.is_none() {
+        metadata.session_id = body_session_id(&body);
+    }
     let routing_log_context = state
         .routing_log
         .as_ref()
@@ -989,6 +1242,16 @@ async fn handle_endpoint_inner(
     response
 }
 
+/// Reads a session ID from the request body's `metadata.session_id`.
+///
+/// Header-derived IDs win. Claude CLI sends the ID in the body when it does not
+/// send a session header.
+fn body_session_id(body: &std::result::Result<Json<Value>, JsonRejection>) -> Option<String> {
+    let Json(value) = body.as_ref().ok()?;
+    let session = value.get("metadata")?.get("session_id")?.as_str()?.trim();
+    (!session.is_empty()).then(|| session.to_string())
+}
+
 fn llm_json_body(
     body: std::result::Result<Json<Value>, JsonRejection>,
 ) -> std::result::Result<Value, (StatusCode, String)> {
@@ -1023,28 +1286,32 @@ fn resolve_route(
     if let Some(metadata) = body.get_mut("metadata").and_then(Value::as_object_mut) {
         metadata.remove(switchyard_translation::util::SWITCHYARD_METADATA_KEY);
     }
-    let llm_request = observed_translation::decode_request(wire_format, &body)
+    let mut llm_request = observed_translation::decode_request(wire_format, &body)
         .map_err(|error| invalid_body_error(StatusCode::BAD_REQUEST, error.to_string()))?;
     let requested_model = llm_request
         .model
         .clone()
-        .filter(|model| !model.trim().is_empty())
-        .ok_or_else(|| {
-            error_response(
+        .filter(|model| !model.trim().is_empty());
+    let (route_model, route) = state
+        .route_for_model(requested_model.as_deref())
+        .ok_or_else(|| match requested_model.as_deref() {
+            Some(model) => error_response(
+                StatusCode::NOT_FOUND,
+                format!("No route registered for model {model}"),
+                "model_not_found",
+                "model_not_found",
+            ),
+            None => error_response(
                 StatusCode::BAD_REQUEST,
                 "request body must include a non-empty string `model`",
                 "invalid_request_error",
                 "invalid_request_error",
-            )
+            ),
         })?;
-    let route = state.route_for_model(&requested_model).ok_or_else(|| {
-        error_response(
-            StatusCode::NOT_FOUND,
-            format!("No route registered for model {requested_model}"),
-            "model_not_found",
-            "model_not_found",
-        )
-    })?;
+    // A missing or unregistered model uses the default route. Give the
+    // algorithm the route's model ID so routing logs and decisions identify
+    // the route that handled the request.
+    llm_request.model = Some(route_model.to_string());
     if let Err(RunnerError::IncompatibleCallerFormat(caller_auth)) =
         route.check_caller_format(wire_format)
     {
@@ -1055,7 +1322,7 @@ fn resolve_route(
         return Err(error_response(
             StatusCode::BAD_REQUEST,
             format!(
-                "route {requested_model} forwards an {provider} login; call it through {expected_endpoint}",
+                "route {route_model} forwards an {provider} login; call it through {expected_endpoint}",
             ),
             "invalid_request_error",
             "invalid_request_error",
@@ -1067,7 +1334,7 @@ fn resolve_route(
         return Err(error_response(
             StatusCode::BAD_REQUEST,
             format!(
-                "route {requested_model} declares {capability} = false; remove the unsupported input or select another route"
+                "route {route_model} declares {capability} = false; remove the unsupported input or select another route"
             ),
             "invalid_request_error",
             "unsupported_capability",
@@ -1103,14 +1370,27 @@ async fn handle_llm_request(
     });
     // Only the Codex namespace mapping is needed downstream, not the whole request.
     let request_extensions = request.llm_request.extensions.clone();
-    let observer = stats_observer(
-        state.stats.clone(),
-        state.routing_log.clone().zip(routing_log_context.clone()),
+    let mut trace = trace_capture(&state, route, &request);
+    let observer = with_trace_outcome(
+        stats_observer(
+            state.stats.clone(),
+            state.routing_log.clone().zip(routing_log_context.clone()),
+        ),
+        trace.as_ref(),
     );
 
     let output = match route.execute(request, Some(observer)).await {
         Ok(output) => output,
         Err(error) => {
+            if let Some(mut trace) = trace {
+                trace.write_recognizer();
+                trace.finish(
+                    None,
+                    None,
+                    started.0.elapsed(),
+                    rsi_trace::StepResult::error(error.to_string()),
+                );
+            }
             if let RunnerError::Algorithm(LibsyError::ClientCall {
                 target,
                 source:
@@ -1129,7 +1409,15 @@ async fn handle_llm_request(
     } = output;
     // The response carries the candidate that actually served it. Fall back to the routing
     // selection for algorithms that return a response without an offloaded model call.
-    let served_model = response.served_model().cloned().or(Some(selected_model));
+    let served_model = response
+        .served_model()
+        .cloned()
+        .or_else(|| Some(selected_model.clone()));
+    if let Some(trace) = trace.as_mut() {
+        trace.selected_model = Some(selected_model.clone());
+        trace.served_model = served_model.clone();
+        trace.write_recognizer();
+    }
     let mut response = if let Some(served_model) = served_model.as_ref() {
         let cache_eligible = cache_probe
             .as_ref()
@@ -1142,8 +1430,12 @@ async fn handle_llm_request(
             state.stats,
             cache_eligible,
             state.routing_log.zip(routing_log_context),
+            trace,
         )
     } else {
+        if let Some(trace) = trace {
+            trace.finish(None, None, started.0.elapsed(), rsi_trace::StepResult::ok());
+        }
         response
     };
 
@@ -1604,6 +1896,64 @@ async fn get_session_stats(
     }
 }
 
+/// Lists the recorded steps for one RSI session, without their message context.
+async fn get_rsi_session_steps(
+    State(state): State<ServerState>,
+    AxumPath(session_id): AxumPath<String>,
+) -> Response {
+    let Some(log) = state.trajectory_log else {
+        // Should be unreachable: the route is only registered with a log.
+        return not_found().await;
+    };
+    let requested = session_id.clone();
+    let steps = match task::spawn_blocking(move || log.read_steps(&requested)).await {
+        Ok(Ok(steps)) => steps,
+        Ok(Err(error)) => {
+            return server_error(format!("failed to read RSI trajectory log: {error}"));
+        }
+        Err(error) => {
+            return server_error(format!("failed to read RSI trajectory log: {error}"));
+        }
+    };
+    if steps.is_empty() {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            "RSI session not found",
+            "not_found",
+            "rsi_session_not_found",
+        );
+    }
+    let summaries: Vec<rsi_trace::StepSummary> = steps.iter().map(Into::into).collect();
+    (
+        StatusCode::OK,
+        Json(json!({"session_id": session_id, "steps": summaries})),
+    )
+        .into_response()
+}
+
+/// Returns one recorded RSI step, including the full message and tool context.
+async fn get_rsi_session_step(
+    State(state): State<ServerState>,
+    AxumPath((session_id, step)): AxumPath<(String, u64)>,
+) -> Response {
+    let Some(log) = state.trajectory_log else {
+        // Should be unreachable: the route is only registered with a log.
+        return not_found().await;
+    };
+    let requested = session_id.clone();
+    match task::spawn_blocking(move || log.read_step(&requested, step)).await {
+        Ok(Ok(Some(record))) => (StatusCode::OK, Json(record)).into_response(),
+        Ok(Ok(None)) => error_response(
+            StatusCode::NOT_FOUND,
+            format!("RSI session {session_id} has no step {step}"),
+            "not_found",
+            "rsi_step_not_found",
+        ),
+        Ok(Err(error)) => server_error(format!("failed to read RSI trajectory log: {error}")),
+        Err(error) => server_error(format!("failed to read RSI trajectory log: {error}")),
+    }
+}
+
 async fn health() -> Json<Value> {
     Json(json!({"status": "ok"}))
 }
@@ -1632,6 +1982,11 @@ fn model_list_payload<'a>(
     let model_ids = entries.iter().map(|(model, _)| *model).collect::<Vec<_>>();
     let first_id = model_ids.first().copied();
     let last_id = model_ids.last().copied();
+    let default_model = model_ids
+        .iter()
+        .find(|model| **model == DEFAULT_ROUTE_MODEL)
+        .copied()
+        .or(first_id);
     json!({
         "object": "list",
         "data": entries.iter().map(|(model, caps)| model_entry_json(model, *caps)).collect::<Vec<_>>(),
@@ -1640,7 +1995,7 @@ fn model_list_payload<'a>(
         "first_id": first_id,
         "last_id": last_id,
         "has_more": false,
-        "default_model": first_id,
+        "default_model": default_model,
         "model_pool": model_ids,
     })
 }
@@ -1674,7 +2029,11 @@ fn startup_banner(options: &ServerRunOptions, state: &ServerState, color: bool) 
     let request_url = request_url_for_addr(scheme, options.addr);
     let routes = state.models().collect::<Vec<_>>();
     let route_list = routes.join(", ");
-    let example_model = routes.first().copied().unwrap_or("switchyard/route");
+    let example_model = routes
+        .iter()
+        .find(|model| **model == DEFAULT_ROUTE_MODEL)
+        .copied()
+        .unwrap_or_else(|| routes.first().copied().unwrap_or("switchyard/route"));
     let example_body = json!({
         "model": example_model,
         "messages": [{"role": "user", "content": "Hello from Switchyard"}],
@@ -1686,7 +2045,7 @@ fn startup_banner(options: &ServerRunOptions, state: &ServerState, color: bool) 
         render_startup_banner_art(color),
         listen_url,
         route_list,
-        endpoint_listing(state.routing_log.is_some()),
+        endpoint_listing(state.routing_log.is_some(), state.trajectory_log.is_some()),
         example_url,
         example_body,
     )
@@ -1743,7 +2102,7 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-fn endpoint_listing(has_routing_log: bool) -> String {
+fn endpoint_listing(has_routing_log: bool, has_trajectory_log: bool) -> String {
     let mut endpoints = vec![
         "  POST /v1/chat/completions    OpenAI Chat Completions",
         "  POST /v1/messages            Anthropic Messages",
@@ -1761,6 +2120,10 @@ fn endpoint_listing(has_routing_log: bool) -> String {
     if has_routing_log {
         endpoints.push("  GET  /v1/routing/session-stats");
     }
+    if has_trajectory_log {
+        endpoints.push("  GET  /v1/rsi/sessions/{session_id}/steps");
+        endpoints.push("  GET  /v1/rsi/sessions/{session_id}/steps/{step}");
+    }
     endpoints.join("\n")
 }
 
@@ -1771,6 +2134,234 @@ mod tests {
     use tokio::sync::{Notify, oneshot};
 
     use super::*;
+
+    #[test]
+    fn body_metadata_supplies_a_session_id() {
+        let body = Ok(Json(json!({"metadata": {"session_id": " claude-1 "}})));
+        assert_eq!(body_session_id(&body).as_deref(), Some("claude-1"));
+
+        let body = Ok(Json(json!({"metadata": {"session_id": "  "}})));
+        assert!(body_session_id(&body).is_none());
+
+        let body = Ok(Json(json!({"metadata": {"session_id": 7}})));
+        assert!(body_session_id(&body).is_none());
+
+        let body = Ok(Json(json!({"messages": []})));
+        assert!(body_session_id(&body).is_none());
+    }
+
+    #[test]
+    fn model_discovery_prefers_the_default_route_id() {
+        let payload = model_list_payload([
+            ("codex-auto-review", ModelCapabilities::default()),
+            ("switchyard/auto", ModelCapabilities::default()),
+            ("switchyard/noop", ModelCapabilities::default()),
+        ]);
+        assert_eq!(payload["default_model"], "switchyard/auto");
+        assert_eq!(payload["first_id"], "codex-auto-review");
+
+        let payload = model_list_payload([
+            ("alpha", ModelCapabilities::default()),
+            ("beta", ModelCapabilities::default()),
+        ]);
+        assert_eq!(payload["default_model"], "alpha");
+    }
+
+    #[test]
+    fn execution_response_omits_preserved_provider_bodies() {
+        let response = AggLlmResponse {
+            id: Some("response-1".to_string()),
+            preservation: switchyard_protocol::PreservationMetadata {
+                responses: std::collections::BTreeMap::from([(
+                    switchyard_protocol::FormatId::from("openai_chat"),
+                    json!({"choices": [{"message": {"content": "hello"}}]}),
+                )]),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let logged = execution_response(&response).expect("json");
+        assert_eq!(logged["id"], "response-1");
+        assert!(logged.get("preservation").is_none());
+    }
+
+    fn trajectory_step(session_id: &str, step: u64) -> rsi_trace::TrajectoryStep {
+        rsi_trace::TrajectoryStep {
+            schema_version: rsi_trace::SCHEMA_VERSION,
+            request_id: format!("request-{step}"),
+            session_id: Some(session_id.to_string()),
+            step,
+            ts: rsi_trace::timestamp(),
+            route_id: "switchyard/rsi".to_string(),
+            algorithm: "rsi_router".to_string(),
+            subtask_id: Some("edit-code".to_string()),
+            confidence: Some(0.93),
+            decision: Some("subtask".to_string()),
+            reason: None,
+            skill_version: Some("v2".to_string()),
+            selected_model: Some("model/cheap".to_string()),
+            served_model: Some("model/cheap".to_string()),
+            result: rsi_trace::StepResult::ok(),
+            usage: None,
+            cost_usd: None,
+            cost_source: None,
+            latency_ms: None,
+            messages: vec![Message::text(
+                switchyard_protocol::Role::User,
+                "Fix the parser",
+            )],
+            instructions: Vec::new(),
+            tools: Vec::new(),
+            response: None,
+        }
+    }
+
+    #[test]
+    fn trace_capture_records_evidence_context_and_patterns() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("rsi.jsonl");
+        let routing_path = dir.path().join("routing.jsonl");
+        let recognizer_path = dir.path().join("recognizer.jsonl");
+        let log = rsi_trace::SharedTrajectoryLog::new(&path).expect("log");
+        let routing_log = rsi_trace::SharedRoutingStepLog::new(&routing_path).expect("routing log");
+        let recognizer_log =
+            rsi_trace::SharedRecognizerLog::new(&recognizer_path).expect("recognizer log");
+        let recorder = TrajectoryRecorder {
+            log: Some(log.clone()),
+            routing_step_log: Some(routing_log),
+            recognizer_log: Some(recognizer_log),
+            pricing: switchyard_costs::Pricing::bundled().expect("pricing"),
+            request_id: "request-a".to_string(),
+            session_id: Some("session-a".to_string()),
+            route_id: "switchyard/rsi".to_string(),
+            step: 2,
+            messages: vec![Message::text(
+                switchyard_protocol::Role::User,
+                "Fix the parser",
+            )],
+            instructions: Vec::new(),
+            tools: Vec::new(),
+            outcome: Arc::new(Mutex::new(Some(libsy::OutcomeMetadata::new(
+                "rsi_router".to_string(),
+                Some(json!({
+                    "decision": "subtask",
+                    "subtask_id": "edit-code",
+                    "confidence": 0.93,
+                    "skill_version": "v2",
+                    "recognizer": {
+                        "model": "model/recognizer",
+                        "prompt": "Available subtasks: edit-code",
+                        "response": "{\"subtask_id\":\"edit-code\",\"confidence\":0.93}",
+                        "subtask_id": "edit-code",
+                        "confidence": 0.93,
+                        "latency_ms": 5.0
+                    }
+                })),
+            )))),
+            selected_model: Some(ModelId::from("openai/gpt-6-luna")),
+            served_model: Some(ModelId::from("openai/gpt-6-luna")),
+        };
+        let usage = Usage {
+            input_tokens: Some(10),
+            output_tokens: Some(2),
+            ..Usage::default()
+        };
+        let output =
+            switchyard_protocol::text_response(Some("openai/gpt-6-luna".to_string()), "done");
+        recorder.finish(
+            Some(&usage),
+            Some(&output),
+            Duration::from_millis(12),
+            rsi_trace::StepResult::ok(),
+        );
+        let step = log.read_step("session-a", 2).expect("read").expect("step");
+        assert_eq!(step.subtask_id.as_deref(), Some("edit-code"));
+        assert_eq!(step.confidence, Some(0.93));
+        assert_eq!(step.skill_version.as_deref(), Some("v2"));
+        assert_eq!(step.selected_model.as_deref(), Some("openai/gpt-6-luna"));
+        assert_eq!(step.messages.len(), 1);
+        assert_eq!(
+            step.usage.as_ref().map(|usage| usage.input_tokens),
+            Some(10)
+        );
+        assert!(step.cost_usd.is_some_and(|cost| cost > 0.0));
+        assert_eq!(step.latency_ms, Some(12.0));
+        assert!(
+            step.response
+                .as_ref()
+                .is_some_and(|response| response.to_string().contains("done"))
+        );
+
+        let records = std::fs::read_to_string(&routing_path).expect("routing log");
+        let record: Value = serde_json::from_str(records.trim()).expect("record");
+        assert_eq!(record["session_id"], "session-a");
+        assert_eq!(record["step"], 2);
+        assert_eq!(record["subtask_id"], "edit-code");
+        assert_eq!(record["selected_model"], "openai/gpt-6-luna");
+        assert!(record["cost_usd"].as_f64().is_some_and(|cost| cost > 0.0));
+        assert!(record["latency_ms"].as_f64().is_some());
+        assert!(record.get("messages").is_none());
+        assert!(record.get("response").is_none());
+
+        let records = std::fs::read_to_string(&recognizer_path).expect("recognizer log");
+        let record: Value = serde_json::from_str(records.trim()).expect("record");
+        assert_eq!(record["session_id"], "session-a");
+        assert_eq!(record["model"], "model/recognizer");
+        assert_eq!(record["subtask_id"], "edit-code");
+        assert!(record["prompt"].as_str().unwrap().contains("edit-code"));
+    }
+
+    #[tokio::test]
+    async fn rsi_trajectory_endpoints_return_summaries_and_step_context() {
+        use tower::ServiceExt as _;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("rsi.jsonl");
+        let log = rsi_trace::SharedTrajectoryLog::new(&path).expect("log");
+        log.append(&trajectory_step("session-a", 1));
+        log.append(&trajectory_step("session-a", 2));
+        let state = ServerState::from_runner(Runner::new(Vec::new()))
+            .expect("state")
+            .with_trajectory_log(&path)
+            .expect("trajectory log");
+        let app = build_switchyard_router(state);
+
+        let response = app
+            .clone()
+            .oneshot(
+                HttpRequest::get("/v1/rsi/sessions/session-a/steps")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let body: Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(body["session_id"], "session-a");
+        assert_eq!(body["steps"].as_array().expect("steps").len(), 2);
+        assert!(body["steps"][0].get("messages").is_none());
+
+        let response = app
+            .oneshot(
+                HttpRequest::get("/v1/rsi/sessions/session-a/steps/2")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let body: Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(body["step"], 2);
+        assert_eq!(body["subtask_id"], "edit-code");
+        assert_eq!(body["messages"][0]["content"][0]["text"], "Fix the parser");
+    }
 
     #[tokio::test]
     async fn decision_continues_incoming_w3c_trace_context() {

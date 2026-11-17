@@ -16,6 +16,9 @@ use switchyard_protocol::{ModelId, WireFormat};
 use crate::config;
 use crate::{ModelCapabilities, Route, RunnerError};
 
+/// Algorithm that serves requests whose model names no configured route.
+const DEFAULT_ALGORITHM_NAME: &str = "rsi_router";
+
 /// Immutable named route table.
 pub struct Runner {
     routes: Vec<(ModelId, Route)>,
@@ -106,10 +109,26 @@ impl Runner {
 
     /// Returns the route registered for a model.
     pub fn route(&self, model: &str) -> Option<&Route> {
+        self.route_entry(model).map(|(_, route)| route)
+    }
+
+    /// Returns the route and its public model ID registered for a model.
+    pub fn route_entry(&self, model: &str) -> Option<(&ModelId, &Route)> {
         self.routes
             .iter()
             .find(|(id, _)| id.as_str() == model)
-            .map(|(_, route)| route)
+            .map(|(id, route)| (id, route))
+    }
+
+    /// Returns the route that serves a request whose model names no configured route.
+    ///
+    /// The default algorithm is RSI. When several `rsi_router` routes are
+    /// configured, the first one in configuration order serves the request.
+    pub fn default_route(&self) -> Option<(&ModelId, &Route)> {
+        self.routes
+            .iter()
+            .find(|(_, route)| route.algorithm_name() == DEFAULT_ALGORITHM_NAME)
+            .map(|(id, route)| (id, route))
     }
 
     /// Iterates over configured routes in caller-provided order.

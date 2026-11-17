@@ -8,6 +8,8 @@ use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::path::PathBuf;
 use std::sync::Arc;
+#[cfg(not(target_os = "wasi"))]
+use std::time::Duration;
 
 use libsy::{
     AdvisorGate, AdvisorGateConfig, Algorithm, BreakerConfig, CapabilityJudgeConfig,
@@ -16,9 +18,11 @@ use libsy::{
     DEFAULT_UNMATCHED_STEPS, DecisionJudgeConfig, DirectClassifierConfig, EscalationJudgeConfig,
     GateTrigger, HandoffNoteConfig, LlmCapabilityConfig, LlmClassifierConfig, LlmFallback,
     LlmTaskClassifier, Noop, Passthrough, PickerMode, PlanExecute, PlanExecuteConfig, Random,
-    RuntimeModels, StageRouter, StageRouterConfig, SubagentRouter, SubagentRouterConfig,
-    TaskClassifierConfig, ToolSemantics, Vgr, VgrConfig,
+    RsiSelection, RuntimeModels, StageRouter, StageRouterConfig, SubagentRouter,
+    SubagentRouterConfig, TaskClassifierConfig, ToolSemantics, Vgr, VgrConfig,
 };
+#[cfg(not(target_os = "wasi"))]
+use libsy::{DEFAULT_RSI_RECOGNIZER_PROMPT, RsiRouter, RsiRouterConfig, SubtaskCatalog};
 use serde::Deserialize;
 use serde_json::Value;
 use strum_macros::IntoStaticStr;
@@ -405,6 +409,77 @@ pub enum PlanExecuteTrigger {
     Judge,
 }
 
+/// Candidate ordering for an `rsi_router` route.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum RsiSelectionConfig {
+    /// Try the lowest cost candidate first.
+    #[default]
+    LowestCost,
+    /// Keep the order the subtask dictionary supplied.
+    CatalogOrder,
+}
+
+impl From<RsiSelectionConfig> for RsiSelection {
+    fn from(value: RsiSelectionConfig) -> Self {
+        match value {
+            RsiSelectionConfig::LowestCost => Self::LowestCost,
+            RsiSelectionConfig::CatalogOrder => Self::CatalogOrder,
+        }
+    }
+}
+
+/// Subtask dictionary and candidate settings for an `rsi_router` route.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RsiRouteConfig {
+    /// Target that labels the current step.
+    pub recognizer_target: String,
+    /// Target used when no subtask route applies.
+    pub flagship_target: String,
+    /// Targets the dictionary may select as execution candidates.
+    pub candidate_targets: Vec<String>,
+    /// Lowest confidence that still enters the candidate route, from 0 to 1.
+    #[serde(default = "default_rsi_confidence_threshold")]
+    pub confidence_threshold: f64,
+    /// How many recent steps the recognizer sees.
+    #[serde(default = "default_rsi_history_steps")]
+    pub history_steps: usize,
+    /// Candidate ordering.
+    #[serde(default)]
+    pub selection: RsiSelectionConfig,
+    /// Replaces the packaged recognition prompt.
+    #[serde(default)]
+    pub recognizer_prompt: Option<String>,
+    /// Most output tokens the recognizer may use.
+    #[serde(default = "default_classifier_max_output_tokens")]
+    pub max_output_tokens: u64,
+    /// Environment variable holding the Redis URL.
+    pub redis_url_env: String,
+    /// Redis key holding the whole subtask catalog as a JSON array.
+    #[serde(default = "default_rsi_catalog_key")]
+    pub redis_catalog_key: String,
+    /// Whole-catalog read timeout in milliseconds.
+    #[serde(default = "default_rsi_redis_timeout_ms")]
+    pub redis_timeout_ms: u64,
+}
+
+fn default_rsi_confidence_threshold() -> f64 {
+    0.7
+}
+
+fn default_rsi_history_steps() -> usize {
+    3
+}
+
+fn default_rsi_catalog_key() -> String {
+    "rsi:subtasks".to_string()
+}
+
+fn default_rsi_redis_timeout_ms() -> u64 {
+    2_000
+}
+
 /// A routing algorithm described by configured target names. Converting it to `&str` gives
 /// the route's `type`, such as `stage_router`.
 #[derive(Clone, Debug, Deserialize, IntoStaticStr)]
@@ -547,6 +622,13 @@ pub enum AlgorithmSpec {
     Vgr {
         #[serde(flatten)]
         config: VgrRouteConfig,
+    },
+    /// Recognizes a subtask, then routes to a Pareto candidate from the subtask dictionary.
+    #[serde(rename = "rsi_router")]
+    #[strum(serialize = "rsi_router")]
+    Rsi {
+        #[serde(flatten)]
+        config: RsiRouteConfig,
     },
     /// Routes using a checkpoint-backed prefill classifier.
     PrefillRouter {
@@ -992,6 +1074,15 @@ impl AlgorithmSpec {
                     config.capable_target.as_str(),
                 ]
             }
+            Self::Rsi { config } => {
+                let mut names = vec![config.flagship_target.as_str()];
+                for name in &config.candidate_targets {
+                    if !names.contains(&name.as_str()) {
+                        names.push(name.as_str());
+                    }
+                }
+                names
+            }
             Self::PrefillRouter { targets, .. } => targets.iter().map(String::as_str).collect(),
         }
     }
@@ -1039,6 +1130,7 @@ impl AlgorithmSpec {
                 names.extend(config.judge_target.as_deref());
                 names.extend(config.capable_judge_target.as_deref());
             }
+            Self::Rsi { config } => names.push(config.recognizer_target.as_str()),
             _ => {}
         }
         // A sub-agent classifier calls its own judge, which is never a completion target.
@@ -1155,6 +1247,19 @@ impl AlgorithmSpec {
                     (Category::Judge, judges),
                 ])
             }
+            Self::Rsi { config } => {
+                let mut any = vec![config.flagship_target.clone()];
+                for name in &config.candidate_targets {
+                    if !any.contains(name) {
+                        any.push(name.clone());
+                    }
+                }
+                category_models([
+                    (Category::Judge, vec![config.recognizer_target.clone()]),
+                    (Category::Capable, vec![config.flagship_target.clone()]),
+                    (Category::Any, any),
+                ])
+            }
         };
 
         let subagents = match self {
@@ -1204,6 +1309,7 @@ impl AlgorithmSpec {
             | Self::StageRouter { .. }
             | Self::Auto { .. }
             | Self::Composite { .. }
+            | Self::Rsi { .. }
             | Self::PrefillRouter { .. } => None,
         }
     }
@@ -2040,6 +2146,7 @@ fn build_algorithm(
             Ok(Arc::new(algorithm))
         }
         AlgorithmSpec::Vgr { config } => build_vgr(route_name, config, targets),
+        AlgorithmSpec::Rsi { config } => build_rsi(route_name, config, targets),
         AlgorithmSpec::PrefillRouter {
             targets: names,
             checkpoint,
@@ -2083,6 +2190,102 @@ fn build_algorithm(
             }
         }
     }
+}
+
+#[cfg(not(target_os = "wasi"))]
+fn build_rsi(
+    route_name: &str,
+    config: &RsiRouteConfig,
+    targets: &BTreeMap<String, ModelId>,
+) -> AlgorithmResult<Arc<dyn Algorithm>> {
+    validate_rsi_targets(route_name, config)?;
+    let recognizer = resolve_target_model_id(route_name, &config.recognizer_target, targets)?;
+    let flagship = resolve_target_model_id(route_name, &config.flagship_target, targets)?;
+    let candidate_models = config
+        .candidate_targets
+        .iter()
+        .map(|name| resolve_target_model_id(route_name, name, targets))
+        .collect::<AlgorithmResult<Vec<_>>>()?;
+    let catalog = match build_rsi_catalog(config) {
+        Ok(catalog) => catalog,
+        Err(error) => {
+            tracing::warn!(
+                route = route_name,
+                %error,
+                "rsi_router has no usable Redis catalog; requests will use the flagship model"
+            );
+            Arc::new(crate::rsi_catalog::UnavailableSubtaskCatalog::new(error))
+                as Arc<dyn SubtaskCatalog>
+        }
+    };
+    let algorithm = RsiRouter::new(RsiRouterConfig {
+        recognizer,
+        flagship,
+        candidate_models,
+        recognizer_prompt: config
+            .recognizer_prompt
+            .clone()
+            .unwrap_or_else(|| DEFAULT_RSI_RECOGNIZER_PROMPT.trim().to_string()),
+        confidence_threshold: config.confidence_threshold,
+        history_steps: config.history_steps,
+        selection: config.selection.into(),
+        max_output_tokens: config.max_output_tokens,
+        catalog,
+    })
+    .map_err(|error| {
+        AlgorithmConfigError::with_source(format!("rsi_router route {route_name}: {error}"), error)
+    })?;
+    Ok(Arc::new(algorithm))
+}
+
+#[cfg(not(target_os = "wasi"))]
+fn build_rsi_catalog(config: &RsiRouteConfig) -> Result<Arc<dyn SubtaskCatalog>, String> {
+    if config.redis_url_env.trim().is_empty() {
+        return Err("redis_url_env is empty".to_string());
+    }
+    let redis_url = std::env::var(&config.redis_url_env)
+        .map_err(|_| format!("environment variable {} is not set", config.redis_url_env))?;
+    let catalog = crate::rsi_catalog::RedisSubtaskCatalog::new(
+        &redis_url,
+        config.redis_catalog_key.clone(),
+        Duration::from_millis(config.redis_timeout_ms),
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(Arc::new(catalog))
+}
+
+#[cfg(target_os = "wasi")]
+fn build_rsi(
+    route_name: &str,
+    config: &RsiRouteConfig,
+    targets: &BTreeMap<String, ModelId>,
+) -> AlgorithmResult<Arc<dyn Algorithm>> {
+    let _ = (config, targets);
+    Err(AlgorithmConfigError::new(format!(
+        "rsi_router route {route_name} requires a non-WASI host"
+    )))
+}
+
+fn validate_rsi_targets(route_name: &str, config: &RsiRouteConfig) -> AlgorithmResult<()> {
+    if config.candidate_targets.is_empty() {
+        return Err(AlgorithmConfigError::new(format!(
+            "rsi_router route {route_name}: candidate_targets must not be empty"
+        )));
+    }
+    let mut seen = BTreeSet::new();
+    for name in &config.candidate_targets {
+        if !seen.insert(name.as_str()) {
+            return Err(AlgorithmConfigError::new(format!(
+                "rsi_router route {route_name}: candidate target {name} is repeated"
+            )));
+        }
+    }
+    if config.redis_timeout_ms == 0 {
+        return Err(AlgorithmConfigError::new(format!(
+            "rsi_router route {route_name}: redis_timeout_ms must be at least 1"
+        )));
+    }
+    Ok(())
 }
 
 fn build_vgr(

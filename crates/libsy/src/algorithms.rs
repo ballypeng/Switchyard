@@ -16,6 +16,7 @@ pub mod noop;
 pub mod passthrough;
 pub mod plan_execute;
 pub mod rand;
+pub mod rsi;
 pub mod stage;
 pub mod subagent;
 pub mod vgr;

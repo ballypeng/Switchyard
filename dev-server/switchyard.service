@@ -15,10 +15,19 @@ ExecStart=/usr/local/bin/switchyard-server \
     -p 443 \
     --config %d/config.toml \
     --tls-key %d/tls-key.pem \
-    --tls-cert %d/tls-cert.pem
+    --tls-cert %d/tls-cert.pem \
+    --trajectory-log-file /var/log/switchyard/rsi-execution.jsonl \
+    --rsi-routing-log-file /var/log/switchyard/rsi-routing.jsonl \
+    --rsi-recognizer-log-file /var/log/switchyard/rsi-recognizer.jsonl
+
+# Creates /var/log/switchyard and gives the dynamic service user access.
+LogsDirectory=switchyard
 
 Restart=on-failure
 Environment="NVIDIA_API_KEY=<PUT-THE-KEY-HERE>"
+# The switchyard/rsi route reads its dictionary from Redis. Change this URL if
+# Redis runs elsewhere. A lookup failure falls back to the flagship model.
+Environment="RSI_REDIS_URL=redis://127.0.0.1:6379/0"
 
 PrivateDevices=yes
 ProtectHome=yes

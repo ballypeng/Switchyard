@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
 use opentelemetry::{KeyValue, global};
-use switchyard_protocol::{LlmResponse, LlmResponseChunk, Response, Usage};
+use switchyard_protocol::{LlmResponse, LlmResponseChunk, Response, ResponseAccumulator, Usage};
 
 use crate::SharedRoutingLog;
 use crate::routing_log::RoutingLogContext;
@@ -21,6 +21,7 @@ pub(crate) fn observe(
     stats: StatsAccumulator,
     cache_eligible: f64,
     routing_log: Option<(SharedRoutingLog, RoutingLogContext)>,
+    trajectory: Option<crate::TrajectoryRecorder>,
 ) -> Response {
     let Response {
         llm_response,
@@ -35,13 +36,26 @@ pub(crate) fn observe(
             if let Some((log, context)) = routing_log {
                 log.append(context, &model, None, &agg.usage);
             }
+            if let Some(recorder) = trajectory {
+                recorder.finish(
+                    Some(&agg.usage),
+                    Some(&agg),
+                    started.elapsed(),
+                    crate::rsi_trace::StepResult::ok(),
+                );
+            }
             LlmResponse::Agg(agg)
         }
         LlmResponse::Stream(mut stream) => {
+            let mut trajectory = trajectory;
+            let capture_output = trajectory
+                .as_ref()
+                .is_some_and(crate::TrajectoryRecorder::captures_output);
             let wrapped = async_stream::stream! {
                 let mut latest_usage = None;
                 let mut terminal_seen = false;
                 let mut recorded = false;
+                let mut output = capture_output.then(ResponseAccumulator::new);
                 while let Some(item) = stream.next().await {
                     let failed = match &item {
                         Err(_) => true,
@@ -55,6 +69,9 @@ pub(crate) fn observe(
                     };
                     if let Ok(event) = &item {
                         for chunk in event.normalized() {
+                            if let Some(output) = output.as_mut() {
+                                output.push(chunk.clone());
+                            }
                             match chunk {
                                 LlmResponseChunk::Usage(usage) => {
                                     latest_usage = Some(usage.clone());
@@ -72,6 +89,15 @@ pub(crate) fn observe(
                     }
                     if failed {
                         record_stream_error(&stats, &model);
+                        if let Some(recorder) = trajectory.take() {
+                            let aggregate = output.take().map(ResponseAccumulator::finish);
+                            recorder.finish(
+                                latest_usage.as_ref(),
+                                aggregate.as_ref(),
+                                started.elapsed(),
+                                crate::rsi_trace::StepResult::error("stream failed"),
+                            );
+                        }
                     }
                     // Responses clients may stop polling immediately after the terminal event.
                     // Commit first when that event already carries the final usage.
@@ -81,6 +107,15 @@ pub(crate) fn observe(
                         record_terminal(&stats, usage, &model, started, cache_eligible);
                         if let Some((log, context)) = routing_log.as_ref() {
                             log.append(context.clone(), &model, None, usage);
+                        }
+                        if let Some(recorder) = trajectory.take() {
+                            let aggregate = output.take().map(ResponseAccumulator::finish);
+                            recorder.finish(
+                                Some(usage),
+                                aggregate.as_ref(),
+                                started.elapsed(),
+                                crate::rsi_trace::StepResult::ok(),
+                            );
                         }
                         recorded = true;
                     }
@@ -94,6 +129,15 @@ pub(crate) fn observe(
                     record_terminal(&stats, &usage, &model, started, cache_eligible);
                     if let Some((log, context)) = routing_log {
                         log.append(context, &model, None, &usage);
+                    }
+                    if let Some(recorder) = trajectory.take() {
+                        let aggregate = output.take().map(ResponseAccumulator::finish);
+                        recorder.finish(
+                            Some(&usage),
+                            aggregate.as_ref(),
+                            started.elapsed(),
+                            crate::rsi_trace::StepResult::ok(),
+                        );
                     }
                 }
             };
@@ -186,8 +230,14 @@ fn record_latency(model: &str, latency: Duration) {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use futures_util::{StreamExt, stream};
-    use switchyard_protocol::{LlmResponseChunk, LlmResponseStreamEvent, Metadata, Response};
+    use libsy::OutcomeMetadata;
+    use parking_lot::Mutex;
+    use switchyard_protocol::{
+        LlmResponse, LlmResponseChunk, LlmResponseStreamEvent, Metadata, ModelId, Response, Usage,
+    };
 
     use super::*;
 
@@ -225,6 +275,7 @@ mod tests {
             stats.clone(),
             0.0,
             Some((log.clone(), context)),
+            None,
         );
 
         let LlmResponse::Stream(mut observed) = observed.llm_response else {
@@ -245,5 +296,84 @@ mod tests {
         let process = stats.snapshot();
         assert_eq!(process.models["model/worker"].prompt_tokens, 10);
         assert_eq!(process.models["model/worker"].completion_tokens, 3);
+    }
+
+    #[tokio::test]
+    async fn streamed_output_is_recorded_in_the_execution_log() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let execution_path = dir.path().join("execution.jsonl");
+        let routing_path = dir.path().join("routing.jsonl");
+        let execution_log =
+            crate::rsi_trace::SharedTrajectoryLog::new(&execution_path).expect("execution log");
+        let routing_log =
+            crate::rsi_trace::SharedRoutingStepLog::new(&routing_path).expect("routing log");
+        let recorder = crate::TrajectoryRecorder {
+            log: Some(execution_log.clone()),
+            routing_step_log: Some(routing_log),
+            recognizer_log: None,
+            pricing: switchyard_costs::Pricing::bundled().expect("pricing"),
+            request_id: "request-stream".to_string(),
+            session_id: Some("stream-session".to_string()),
+            route_id: "switchyard/rsi".to_string(),
+            step: 1,
+            messages: Vec::new(),
+            instructions: Vec::new(),
+            tools: Vec::new(),
+            outcome: Arc::new(Mutex::new(Some(OutcomeMetadata::new(
+                "rsi_router".to_string(),
+                Some(serde_json::json!({
+                    "decision": "subtask",
+                    "subtask_id": "edit-code"
+                })),
+            )))),
+            selected_model: Some(ModelId::from("openai/gpt-6-luna")),
+            served_model: Some(ModelId::from("openai/gpt-6-luna")),
+        };
+        let usage = Usage {
+            input_tokens: Some(10),
+            output_tokens: Some(2),
+            ..Usage::default()
+        };
+        let source = stream::iter([Ok(LlmResponseStreamEvent::new(vec![
+            LlmResponseChunk::TextDelta {
+                index: 0,
+                text: "hello".to_string(),
+            },
+            LlmResponseChunk::Usage(usage),
+            LlmResponseChunk::MessageStop { reason: None },
+        ]))]);
+        let response = Response {
+            llm_response: LlmResponse::Stream(Box::pin(source)),
+            metadata: None,
+            upstream_headers: http::HeaderMap::new(),
+        };
+        let observed = observe(
+            response,
+            "openai/gpt-6-luna",
+            Instant::now(),
+            StatsAccumulator::default(),
+            0.0,
+            None,
+            Some(recorder),
+        );
+        let LlmResponse::Stream(mut observed) = observed.llm_response else {
+            panic!("expected stream");
+        };
+        while observed.next().await.is_some() {}
+
+        let step = execution_log
+            .read_step("stream-session", 1)
+            .expect("read")
+            .expect("step");
+        assert!(
+            step.response
+                .as_ref()
+                .is_some_and(|response| response.to_string().contains("hello"))
+        );
+        assert_eq!(
+            step.usage.as_ref().map(|usage| usage.input_tokens),
+            Some(10)
+        );
+        assert!(step.cost_usd.is_some_and(|cost| cost > 0.0));
     }
 }

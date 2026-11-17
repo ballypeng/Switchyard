@@ -603,6 +603,54 @@ advisor's plan. See
 | `reviewer_system_prompt` | No | packaged prompt | Replaces the APPROVE/REDO reviewer prompt. |
 | `redo_feedback_prefix` | No | packaged prompt | Replaces the text put in front of a REDO plan fed back to the executor. |
 
+### `rsi_router`
+
+Reads the whole subtask catalog from Redis, shows every subtask's ID, name, and
+definition to a small recognizer model, and runs the cheapest candidate of the
+selected subtask. Falls back to a flagship target when recognition is weak or
+missing. See [RSI Router](../routing_algorithms/rsi_routing.md).
+
+| Key | Required | Default | Meaning |
+|---|:---:|---|---|
+| `recognizer_target` | Yes | — | Target that labels the current step. Not a completion target. |
+| `flagship_target` | Yes | — | Target used when no subtask route applies. It may also appear in `candidate_targets`. |
+| `candidate_targets` | Yes | — | Targets the dictionary may select. Names must be unique. |
+| `confidence_threshold` | No | `0.7` | Lowest confidence that enters the candidate route. In `[0, 1]`. |
+| `history_steps` | No | `3` | Recent steps shown to the recognizer. Must be at least `1`. |
+| `selection` | No | `lowest_cost` | `lowest_cost` or `catalog_order`. |
+| `recognizer_prompt` | No | packaged prompt | Replaces the recognition instructions. |
+| `max_output_tokens` | No | `4096` | Maximum tokens for the recognizer output. Must be at least `1`. |
+| `redis_url_env` | Yes | — | Environment variable holding the Redis URL. The URL may use `redis://` or `rediss://`. If the variable is unset, empty, or invalid, the route logs a warning and uses the flagship model. |
+| `redis_catalog_key` | No | `rsi:subtasks` | Redis key holding the catalog array. |
+| `redis_timeout_ms` | No | `2000` | Timeout for one catalog read. Must be at least `1`. |
+
+The Redis value at `redis_catalog_key` is one JSON array. It holds every
+subtask:
+
+```json
+[
+  {
+    "subtask_id": "edit-code",
+    "subtask_name": "Edit code",
+    "definition": "Change existing source files in a small, focused patch.",
+    "candidates": [
+      {"model_id": "model/cheap", "cost_per_million_tokens": 0.4},
+      {"model_id": "model/mid", "cost_per_million_tokens": 1.2}
+    ],
+    "skill": {"version": "1.4.0", "template": "Read the nearby tests first."}
+  }
+]
+```
+
+`subtask_id`, `subtask_name`, and `definition` are shown to the recognizer. The
+recognizer must choose one listed ID, or return an empty ID when the step does
+not fit any definition. `model_id` must be the configured model ID of a target
+named in `candidate_targets`. The router ignores other entries. The `skill`
+field is optional. Its template is added to the request as a system instruction,
+and its version is written to the step record.
+
+A route with `rsi_router` does not accept `subagents`.
+
 ## Validation Errors
 
 `--dry-run` prefixes configuration failures with
