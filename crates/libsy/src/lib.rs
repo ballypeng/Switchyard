@@ -31,8 +31,8 @@ pub use algorithms::passthrough::Passthrough;
 pub use algorithms::plan_execute::{PlanExecute, PlanExecuteConfig};
 pub use algorithms::rand::{Random, RandomClassifier};
 pub use algorithms::rsi::{
-    DEFAULT_RSI_RECOGNIZER_PROMPT, RsiRouter, RsiRouterConfig, RsiSelection, SkillTemplate,
-    SubtaskCandidate, SubtaskCatalog, SubtaskEntry,
+    DEFAULT_RSI_RECOGNIZER_PROMPT, RsiRouter, RsiRouterConfig, RsiSelection, SubtaskCandidate,
+    SubtaskCatalog, SubtaskSummary,
 };
 pub use algorithms::stage::{LlmFallback, StageRouter, StageRouterConfig};
 pub use algorithms::subagent::{SubagentRouter, SubagentRouterConfig};

@@ -29,6 +29,11 @@ tracing.workspace = true
 
 [target.'cfg(not(target_os = "wasi"))'.dependencies]
 async-trait.workspace = true
+mysql_async = { version = "0.37", default-features = false, features = [
+    "minimal-rust",
+    "rustls-tls",
+    "aws-lc-rs",
+] }
 reqwest.workspace = true
 rustls-native-certs = "0.8"
 switchyard-llm-client.workspace = true

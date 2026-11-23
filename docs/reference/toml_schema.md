@@ -605,49 +605,50 @@ advisor's plan. See
 
 ### `rsi_router`
 
-Reads the whole subtask catalog from Redis, shows every subtask's ID, name, and
-definition to a small recognizer model, and runs the cheapest candidate of the
-selected subtask. Falls back to a flagship target when recognition is weak or
-missing. See [RSI Router](../routing_algorithms/rsi_routing.md).
+Reads the subtask list from MySQL, shows every subtask's ID, name, and
+definition to a small recognizer model, and only then reads the recognized
+subtask's candidates. It orders them with `selection` and runs the first one.
+Falls back to a flagship target when recognition is weak or missing. See
+[RSI Router](../routing_algorithms/rsi_routing.md).
 
 | Key | Required | Default | Meaning |
 |---|:---:|---|---|
 | `recognizer_target` | Yes | — | Target that labels the current step. Not a completion target. |
-| `flagship_target` | Yes | — | Target used when no subtask route applies. It may also appear in `candidate_targets`. |
+| `flagship_target` | Yes | — | Target used when no subtask route applies. It may also appear in `candidate_targets`. Unused when `fixed_target` is set. |
 | `candidate_targets` | Yes | — | Targets the dictionary may select. Names must be unique. |
 | `confidence_threshold` | No | `0.7` | Lowest confidence that enters the candidate route. In `[0, 1]`. |
+| `min_success_rate` | No | `0.0` | Candidates with a lower success rate are removed before selection. In `[0, 1]`. `0` keeps every candidate. |
 | `history_steps` | No | `3` | Recent steps shown to the recognizer. Must be at least `1`. |
-| `selection` | No | `lowest_cost` | `lowest_cost` or `catalog_order`. |
+| `selection` | No | `lowest_cost` | `highest_success`, `lowest_cost`, or `lowest_latency`. |
+| `fixed_target` | No | unset | When set, every request is served by this target, including unrecognized subtasks and catalog failures. It replaces `flagship_target`. Skill injection still applies when a subtask and its candidates are available. |
+| `skill_injected` | No | `true` | When `false`, the selected candidate's skill reminder is not appended to the request. |
 | `recognizer_prompt` | No | packaged prompt | Replaces the recognition instructions. |
 | `max_output_tokens` | No | `4096` | Maximum tokens for the recognizer output. Must be at least `1`. |
-| `redis_url_env` | Yes | — | Environment variable holding the Redis URL. The URL may use `redis://` or `rediss://`. If the variable is unset, empty, or invalid, the route logs a warning and uses the flagship model. |
-| `redis_catalog_key` | No | `rsi:subtasks` | Redis key holding the catalog array. |
-| `redis_timeout_ms` | No | `2000` | Timeout for one catalog read. Must be at least `1`. |
+| `mysql_url_env` | Yes | — | Environment variable holding the MySQL URL, for example `mysql://user:password@host:3306/switchyard`. If the variable is unset, empty, or invalid, the route logs a warning and uses the flagship model. |
+| `mysql_timeout_ms` | No | `2000` | Timeout for one catalog query. Must be at least `1`. |
 
-The Redis value at `redis_catalog_key` is one JSON array. It holds every
-subtask:
+The dictionary lives in two MySQL tables. `subtask` holds what the recognizer
+reads: `subtask_id`, `subtask_name`, and `definition` (what the subtask does,
+its input, its expected output, and its typical failure points). The recognizer
+must choose one listed ID, or return an empty ID when the step does not fit any
+definition.
 
-```json
-[
-  {
-    "subtask_id": "edit-code",
-    "subtask_name": "Edit code",
-    "definition": "Change existing source files in a small, focused patch.",
-    "candidates": [
-      {"model_id": "model/cheap", "cost_per_million_tokens": 0.4},
-      {"model_id": "model/mid", "cost_per_million_tokens": 1.2}
-    ],
-    "skill": {"version": "1.4.0", "template": "Read the nearby tests first."}
-  }
-]
-```
-
-`subtask_id`, `subtask_name`, and `definition` are shown to the recognizer. The
-recognizer must choose one listed ID, or return an empty ID when the step does
-not fit any definition. `model_id` must be the configured model ID of a target
-named in `candidate_targets`. The router ignores other entries. The `skill`
-field is optional. Its template is added to the request as a system instruction,
-and its version is written to the step record.
+`candidate_model` holds the Pareto set of each subtask, read after recognition:
+`subtask_id`, `model_id`, `cost`, `latency` (milliseconds, or `latency_ms`),
+`success` or `success_rate` (a share from 0 to 1, or a percentage from 1 to
+100), `skill_content` (optional), `skill_version` (optional, numeric; missing
+reads as `0`), and `is_valid` (optional; `0` excludes the row from skill
+injection, missing reads as valid). `model_id` must be the configured
+model ID of a target named in `candidate_targets`. The router skips rows that
+name another model, rows with a missing or out-of-range `cost`, `latency`, or
+`success`, and rows whose `success` is below `min_success_rate`. `selection`
+picks which column orders the remaining candidates. The first
+candidate runs the step. When the step switches to a new subtask, the
+`skill_content` with the highest `skill_version` among valid (`is_valid` not `0`)
+candidates is placed as a `<skill_reminder>` message at the start of that
+subtask: a user message on OpenAI-compatible endpoints, or a system message on
+Anthropic-compatible endpoints. Later steps of the same subtask keep the
+reminder at that position instead of adding a new one at the end.
 
 A route with `rsi_router` does not accept `subagents`.
 

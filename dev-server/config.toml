@@ -9,6 +9,12 @@ format = "openai_chat"
 base_url = "http://localhost:25947/proxy"
 api_key_env = "NVIDIA_API_KEY"
 
+[llm_clients.local_hub]
+format = "openai_chat"
+# base_url = "http://192.168.3.5:8090"
+base_url = "http://192.168.3.13:8090"
+api_key_env = "NVIDIA_API_KEY"
+
 [decision_clients.decisions]
 format = "openai_decisions"
 endpoint = "https://inference-api.nvidia.com/v1/decisions"
@@ -23,8 +29,9 @@ llm_client = "inference_hub"
 # extra_body = { reasoning = { effort = "medium" } }
 
 [targets.efficient]
-id = "GLM-5.3-Flash"
-llm_client = "inference_hub"
+# id = "/Users/jiuwen/Models/Qwen3.5-9B-4bit" # local_hub 上真实的模型 id(qwen3.5-9b 在 hub 上不存在)
+id = "/Users/synco/Models/Qwen3.5-9B-4bit" # local_hub 上真实的模型 id(qwen3.5-9b 在 hub 上不存在)
+llm_client = "local_hub"
 # extra_body = { reasoning = { effort = "medium" } }
 
 [targets.recognizer]
@@ -127,29 +134,38 @@ target = "efficient"
 
 # Default route: RSI router
 #
-# It reads a Redis URL from RSI_REDIS_URL. The server reads the whole subtask
-# catalog from Redis before each recognition, includes every subtask's ID, name,
-# and definition in the recognizer prompt, and sends the step to the cheapest
-# candidate of the selected subtask. If the variable is unset, the URL is
-# invalid, or a read fails, the route uses the flagship model and keeps serving.
+# It reads a MySQL URL from RSI_MYSQL_URL. The server first reads the `subtask`
+# table (subtask_id, subtask_name, definition), includes every subtask's ID,
+# name, and definition in the recognizer prompt, and only after recognition
+# reads the `candidate_model` rows of the recognized subtask. It drops candidates
+# below `min_success_rate` (0 disables the filter), orders the rest by `selection`
+# (highest_success, lowest_cost, or lowest_latency), and routes to the first one.
+# It injects the `skill_content` with the highest `skill_version` among the
+# recognized subtask's valid candidates (`is_valid` not 0) as a `<skill_reminder>`
+# message (user role for
+# OpenAI formats, system role for Anthropic). Every request gets one reminder; an
+# existing reminder for the same subtask is not repeated.
+# `skill_injected = false` turns the reminder off.
+# If the variable is unset, the URL is invalid, or a query fails, the route uses
+# the flagship model and keeps serving.
 #
-# The catalog is one JSON array at Redis key `rsi:subtasks` (change it with
-# redis_catalog_key). Example:
-# [
-#   {
-#     "subtask_id": "edit-code",
-#     "subtask_name": "Edit code",
-#     "definition": "Change existing source files in a small, focused patch.",
-#     "candidates": [
-#       {"model_id": "openai/openai/gpt-6-luna", "cost_per_million_tokens": 0.6},
-#       {"model_id": "DeepSeek-V4.1-Flash-1017", "cost_per_million_tokens": 2.0}
-#     ],
-#     "skill": {
-#       "version": "v1",
-#       "template": "Read the nearby tests before editing."
-#     }
-#   }
-# ]
+# Tables:
+# CREATE TABLE subtask (
+#   subtask_id   VARCHAR(191) PRIMARY KEY,
+#   subtask_name VARCHAR(255) NOT NULL DEFAULT '',
+#   definition   TEXT NOT NULL  -- 要做什么、输入是什么、预期产出、典型失败点
+# );
+# CREATE TABLE candidate_model (
+#   subtask_id    VARCHAR(191) NOT NULL,
+#   model_id      VARCHAR(255) NOT NULL,  -- 必须是 candidate_targets 里某个 target 的 id
+#   cost          DOUBLE NOT NULL,
+#   latency       DOUBLE NOT NULL,        -- 毫秒（也可命名为 latency_ms）
+#   success       DOUBLE NOT NULL,        -- 也可命名为 success_rate；0 到 1，或 1 到 100 的百分比
+#   skill_content TEXT NULL,
+#   skill_version DOUBLE NOT NULL DEFAULT 0,  -- 数值最大的 skill_content 会被注入
+#   is_valid      TINYINT(1) NOT NULL DEFAULT 1,  -- 0 表示该行不参与 skill 注入
+#   PRIMARY KEY (subtask_id, model_id)
+# );
 
 [routes.auto]
 id = "switchyard/auto"
@@ -157,20 +173,30 @@ type = "rsi_router"
 recognizer_target = "recognizer" # 小模型 S
 flagship_target = "capable" # 兜底模型
 candidate_targets = ["capable", "efficient"] # 执行模型池
-redis_url_env = "RSI_REDIS_URL"
+mysql_url_env = "RSI_MYSQL_URL"
 confidence_threshold = 0.7
-history_steps = 5
+min_success_rate = 1
+fixed_target = "efficient"  # 设置后所有请求都用该 target 执行，跳过筛选排序，不再回退 flagship_target；未识别/字典失败时也一样
+history_steps = 6
 selection = "lowest_cost"
+# selection = "highest_success"
+# selection = "lowest_latency"
+skill_injected = true  # false=不注入；true=在 is_valid 非 0 的候选中注入 skill_version 最大的 skill_content
 
 # Explicit alias for clients that still send switchyard/rsi.
 [routes.rsi]
 id = "switchyard/rsi"
 type = "rsi_router"
 recognizer_target = "recognizer"
-flagship_target = "capable"
+flagship_target = "efficient"
 candidate_targets = ["capable", "efficient"]
-redis_url_env = "RSI_REDIS_URL"
+mysql_url_env = "RSI_MYSQL_URL"
 confidence_threshold = 0.7
-history_steps = 5
+min_success_rate = 1
+# fixed_target = "capable"  # 设置后所有请求都用该 target 执行，跳过筛选排序，不再回退 flagship_target
+history_steps = 6
 selection = "lowest_cost"
+# selection = "highest_success"
+# selection = "lowest_latency"
+skill_injected = false  # false 时不注入；true 时在 is_valid 非 0 的候选中注入 skill_version 最大的 skill_content
 

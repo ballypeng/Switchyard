@@ -7,7 +7,7 @@
 //! response. [`Metadata::from_headers`] normalizes host-specific HTTP headers into
 //! that neutral shape.
 
-use std::{collections::BTreeMap, str::FromStr as _};
+use std::{collections::BTreeMap, str::FromStr as _, sync::Arc};
 
 use crate::{ModelId, WireFormat};
 
@@ -199,10 +199,20 @@ pub struct Metadata {
     pub subagent_identity_unsupported: bool,
     /// Switchyard target that successfully served a response.
     pub served_model: Option<ModelId>,
+    /// The exact request body the LLM client sent upstream for the response this
+    /// metadata travels with. Set by the client after a successful send, after
+    /// model resolution and every backend transformation; hosts use it for
+    /// durable interaction logs. Held in an `Arc` because metadata is cloned per
+    /// call and the body can be large.
+    pub upstream_request: Option<Arc<serde_json::Value>>,
     /// Arbitrary host-defined key/value metadata.
     pub extra_metadata: Option<BTreeMap<String, String>>,
     /// HTTP headers to attach when forwarding the request/response, if any.
     pub http_headers: Option<http::HeaderMap>,
+    /// Wire format of the inbound client request, before any target translation.
+    /// Hosts set this to tell algorithms how the caller framed the request.
+    /// Unlike [`Self::wire_format`], it does not pin the backend format.
+    pub caller_wire_format: Option<WireFormat>,
     /// The wire format the request/response was originally encoded in, if known.
     pub wire_format: Option<WireFormat>,
 }

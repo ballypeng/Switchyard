@@ -12,11 +12,11 @@ mod algorithm_factory;
 mod config;
 #[cfg(not(target_os = "wasi"))]
 mod failure;
+#[cfg(not(target_os = "wasi"))]
+mod mysql_catalog;
 mod provider_key_redactor;
 #[cfg(not(target_os = "wasi"))]
 mod route;
-#[cfg(not(target_os = "wasi"))]
-mod rsi_catalog;
 #[cfg(not(target_os = "wasi"))]
 mod runner;
 

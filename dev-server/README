@@ -3,7 +3,7 @@
 ```curl --insecure -s 'https://switchyard-dev.nvidia.com/v1/chat/completions' -H 'Content-Type: application/json' -d '{"messages":[{"content":"Hello from Switchyard","role":"user"}],"model":"switchyard/auto","max_tokens": 4096}'```
 
 It has the following endpoints connected to Inference Hub:
-* `switchyard/auto`: RSI router. The default route. Uses `recognizer` (Qwen3.8-Flash) to label the step, reads the subtask catalog from Redis, and runs the cheapest candidate from `capable` and `efficient`. Falls back to `capable`.
+* `switchyard/auto`: RSI router. The default route. Uses `recognizer` (Qwen3.8-Flash) to label the step, reads the subtask list from MySQL, then the recognized subtask's candidates, and runs the best candidate by `selection` (cost by default). Falls back to `capable`.
 * `switchyard/composite`: Composite. Decision model as classifier (Mercury Decide), then Stage on tool call signals.
 * `switchyard/rsi`: Alias for the same RSI route.
 * `switchyard/noop`
@@ -16,18 +16,30 @@ It has the following endpoints connected to Inference Hub:
 ## RSI router
 
 `switchyard/auto` is the default RSI route. `switchyard/rsi` is an alias with the
-same settings. Both read Redis through `RSI_REDIS_URL`. The systemd unit sets
-`redis://127.0.0.1:6379/0` by default. Change it if Redis runs elsewhere, or
-export the variable before starting the server.
+same settings. Both read MySQL through `RSI_MYSQL_URL`. The systemd unit sets
+`mysql://127.0.0.1:3306/switchyard` by default. Change it if MySQL runs
+elsewhere, or export the variable before starting the server.
 
-If the variable is unset, the URL is invalid, or a read fails, the server still
-starts. The route logs a warning and uses the flagship model for every request.
+If the variable is unset, the URL is invalid, or a query fails, the server
+still starts. The route logs a warning and uses the flagship model for every
+request.
 
-The catalog is one JSON array at Redis key `rsi:subtasks` by default. Change
-the key with `redis_catalog_key`. Each entry needs `subtask_id`, `subtask_name`,
-`definition`, and `candidates`. The recognizer sees the ID, name, and
-definition, then picks an ID. Candidates use the target model IDs configured in
-`[targets]`.
+The dictionary lives in two tables. `subtask` holds `subtask_id`, `subtask_name`,
+and `definition` (what the subtask does, its input, its expected output, and its
+typical failure points). The recognizer sees those and picks an ID. After
+recognition, `candidate_model` supplies that subtask's candidates: `model_id`
+(one of the target model IDs configured in `[targets]`), `cost`, `latency` (in
+milliseconds; the column may also be named `latency_ms`), `success` or
+`success_rate` (from 0 to 1, or from 1 to 100 as a percentage), and
+`skill_content` (optional). The route first drops candidates whose `success` is
+below `min_success_rate`, orders the rest with `selection`, and runs the first
+one. If every candidate is filtered out, it uses the flagship model. Setting
+`fixed_target` skips selection entirely: every recognized step runs on that
+target, with the skill of the dictionary candidate matching it. The skill
+is appended to the conversation as a
+`<skill_reminder>` message: a user message for OpenAI-compatible requests and a
+system message for Anthropic requests. Every request gets one reminder; an
+existing reminder for the same subtask is not repeated.
 
 The three RSI logs are enabled by default:
 
@@ -49,7 +61,7 @@ The network has some kind of throttling. Not good for evals, but fine for poking
 
 ## Files in this folder
 
-- `switchyard.service`. The systemd unit. Goes in `/etc/systemd/system/switchyard.service`. Remember to `systemctl daemon-reload` if you change it. REMEMBER TO ADD THE API KEY. The `switchyard/rsi` route also needs `RSI_REDIS_URL`.
+- `switchyard.service`. The systemd unit. Goes in `/etc/systemd/system/switchyard.service`. Remember to `systemctl daemon-reload` if you change it. REMEMBER TO ADD THE API KEY. The `switchyard/rsi` route also needs `RSI_MYSQL_URL`.
 - `config.toml`. The switchyard-server config. Goes in `/etc/switchyard/`.
 
 ## Details

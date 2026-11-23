@@ -15,7 +15,7 @@ use humantime::format_rfc3339_millis;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use switchyard_costs::CostSource;
-use switchyard_protocol::{InstructionBlock, Message, Role, Tool, Usage};
+use switchyard_protocol::{Message, Role, Usage};
 
 use crate::{ServerError, ServerResult};
 
@@ -46,15 +46,16 @@ pub(crate) struct TrajectoryStep {
     /// Recognizer confidence, when one applied.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confidence: Option<f64>,
-    /// Router decision: `subtask` or `flagship`.
+    /// Router decision: `subtask`, `flagship`, or `fixed_target` when a
+    /// configured fixed target served a step that had no subtask route.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decision: Option<String>,
     /// Why the router chose the flagship model, when it did.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
-    /// Skill template version applied to the step.
+    /// Whether the selected candidate's skill reminder was appended to the step.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub skill_version: Option<String>,
+    pub skill_injected: Option<bool>,
     /// Model the router selected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected_model: Option<String>,
@@ -75,14 +76,13 @@ pub(crate) struct TrajectoryStep {
     /// End-to-end step latency in milliseconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latency_ms: Option<f64>,
-    /// Full conversation at this step.
-    pub messages: Vec<Message>,
-    /// System and developer instructions at this step.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub instructions: Vec<InstructionBlock>,
-    /// Tools available at this step.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub tools: Vec<Tool>,
+    /// The request body the client sent to the execution model for this step,
+    /// after model resolution, format conversion, and backend transforms. This is
+    /// what the model actually received, so it is the source for offline
+    /// analysis. Absent when the step failed before a model call succeeded, or in
+    /// records written before this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_request: Option<serde_json::Value>,
     /// Normalized response returned by the execution model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response: Option<serde_json::Value>,
@@ -162,7 +162,7 @@ pub(crate) struct StepSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub skill_version: Option<String>,
+    pub skill_injected: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -187,7 +187,7 @@ impl From<&TrajectoryStep> for StepSummary {
             confidence: step.confidence,
             decision: step.decision.clone(),
             reason: step.reason.clone(),
-            skill_version: step.skill_version.clone(),
+            skill_injected: step.skill_injected,
             result: step.result.clone(),
             selected_model: step.selected_model.clone(),
             served_model: step.served_model.clone(),
@@ -331,6 +331,18 @@ pub(crate) fn recognizer_record(
     })
 }
 
+/// One Pareto candidate as it entered selection.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct RoutingCandidate {
+    pub model_id: String,
+    pub cost: f64,
+    pub latency_ms: f64,
+    pub success_rate: f64,
+    pub configured: bool,
+    pub above_min_success_rate: bool,
+    pub selected: bool,
+}
+
 /// One routing decision, written without the step's message context.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct RoutingStep {
@@ -351,7 +363,19 @@ pub(crate) struct RoutingStep {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confidence: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub skill_version: Option<String>,
+    pub confidence_threshold: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_success_rate: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fixed_target: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidates: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pareto_candidates: Option<Vec<RoutingCandidate>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill_injected: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -527,7 +551,7 @@ fn trajectory_error(path: &Path, error: std::io::Error) -> ServerError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use switchyard_protocol::{ContentBlock, Message};
+    use switchyard_protocol::Message;
 
     fn step(session: &str, number: u64) -> TrajectoryStep {
         TrajectoryStep {
@@ -542,7 +566,7 @@ mod tests {
             confidence: Some(0.9),
             decision: Some("subtask".to_string()),
             reason: None,
-            skill_version: Some("v1".to_string()),
+            skill_injected: Some(true),
             selected_model: Some("model/cheap".to_string()),
             served_model: Some("model/cheap".to_string()),
             result: StepResult::ok(),
@@ -554,9 +578,10 @@ mod tests {
             cost_usd: Some(0.0001),
             cost_source: Some("estimated".to_string()),
             latency_ms: Some(12.5),
-            messages: vec![Message::text(Role::User, "Fix the parser")],
-            instructions: Vec::new(),
-            tools: Vec::new(),
+            upstream_request: Some(serde_json::json!({
+                "model": "model/cheap",
+                "messages": [{"role": "user", "content": "Fix the parser"}]
+            })),
             response: Some(serde_json::json!({
                 "outputs": [{"role": "assistant", "content": [{"type": "text", "text": "done"}]}]
             })),
@@ -577,10 +602,11 @@ mod tests {
         assert_eq!(steps[0].step, 1);
         assert_eq!(steps[1].step, 2);
         assert_eq!(
-            steps[1].messages[0].content[0],
-            ContentBlock::Text {
-                text: "Fix the parser".to_string()
-            }
+            steps[1]
+                .upstream_request
+                .as_ref()
+                .expect("upstream request")["messages"][0]["content"],
+            "Fix the parser"
         );
         assert_eq!(
             log.read_step("session-a", 2)
@@ -617,8 +643,7 @@ mod tests {
     fn summaries_omit_the_context() {
         let summary = StepSummary::from(&step("session-a", 1));
         let json = serde_json::to_value(summary).expect("json");
-        assert!(json.get("messages").is_none());
-        assert!(json.get("tools").is_none());
+        assert!(json.get("upstream_request").is_none());
         assert_eq!(json["subtask_id"], "edit-code");
         assert_eq!(json["cost_usd"], 0.0001);
         assert_eq!(json["latency_ms"], 12.5);
@@ -672,7 +697,21 @@ mod tests {
             reason: step.reason,
             subtask_id: step.subtask_id,
             confidence: step.confidence,
-            skill_version: step.skill_version,
+            confidence_threshold: Some(0.7),
+            min_success_rate: Some(0.6),
+            fixed_target: None,
+            selection: Some("lowest_cost".to_string()),
+            candidates: Some(vec!["model/cheap".to_string()]),
+            pareto_candidates: Some(vec![RoutingCandidate {
+                model_id: "model/cheap".to_string(),
+                cost: 0.4,
+                latency_ms: 900.0,
+                success_rate: 0.8,
+                configured: true,
+                above_min_success_rate: true,
+                selected: true,
+            }]),
+            skill_injected: step.skill_injected,
             selected_model: step.selected_model,
             served_model: step.served_model,
             result: step.result,
@@ -690,6 +729,11 @@ mod tests {
         assert_eq!(record["subtask_id"], "edit-code");
         assert_eq!(record["selected_model"], "model/cheap");
         assert_eq!(record["cost_usd"], 0.0001);
+        assert_eq!(record["min_success_rate"], 0.6);
+        assert_eq!(record["selection"], "lowest_cost");
+        assert_eq!(record["candidates"], serde_json::json!(["model/cheap"]));
+        assert_eq!(record["pareto_candidates"][0]["model_id"], "model/cheap");
+        assert_eq!(record["pareto_candidates"][0]["success_rate"], 0.8);
         assert!(record.get("messages").is_none());
     }
 }

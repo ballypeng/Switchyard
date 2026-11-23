@@ -29,6 +29,7 @@ pub(crate) fn observe(
         upstream_headers,
     } = response;
     let model = model.to_string();
+    let upstream_request = metadata.as_ref().and_then(|m| m.upstream_request.clone());
 
     let llm_response = match llm_response {
         LlmResponse::Agg(agg) => {
@@ -40,6 +41,7 @@ pub(crate) fn observe(
                 recorder.finish(
                     Some(&agg.usage),
                     Some(&agg),
+                    upstream_request.as_deref(),
                     started.elapsed(),
                     crate::rsi_trace::StepResult::ok(),
                 );
@@ -94,6 +96,7 @@ pub(crate) fn observe(
                             recorder.finish(
                                 latest_usage.as_ref(),
                                 aggregate.as_ref(),
+                                upstream_request.as_deref(),
                                 started.elapsed(),
                                 crate::rsi_trace::StepResult::error("stream failed"),
                             );
@@ -113,6 +116,7 @@ pub(crate) fn observe(
                             recorder.finish(
                                 Some(usage),
                                 aggregate.as_ref(),
+                                upstream_request.as_deref(),
                                 started.elapsed(),
                                 crate::rsi_trace::StepResult::ok(),
                             );
@@ -135,6 +139,7 @@ pub(crate) fn observe(
                         recorder.finish(
                             Some(&usage),
                             aggregate.as_ref(),
+                            upstream_request.as_deref(),
                             started.elapsed(),
                             crate::rsi_trace::StepResult::ok(),
                         );
@@ -316,9 +321,6 @@ mod tests {
             session_id: Some("stream-session".to_string()),
             route_id: "switchyard/rsi".to_string(),
             step: 1,
-            messages: Vec::new(),
-            instructions: Vec::new(),
-            tools: Vec::new(),
             outcome: Arc::new(Mutex::new(Some(OutcomeMetadata::new(
                 "rsi_router".to_string(),
                 Some(serde_json::json!({

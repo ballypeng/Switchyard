@@ -45,8 +45,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use switchyard_llm_client::{AuxiliaryOperation, RunObservation, RunObserver};
 use switchyard_protocol::{
-    AggLlmResponse, InstructionBlock, LlmClientError, Message, Metadata, ModelId,
-    ProviderExtensions, Request, Tool, Usage,
+    AggLlmResponse, LlmClientError, Metadata, ModelId, ProviderExtensions, Request, Usage,
 };
 use switchyard_runner::{
     CallerAuthKind, DecisionTarget, ModelCapabilities, Route, RunOutput, Runner, RunnerError,
@@ -503,9 +502,6 @@ struct TrajectoryRecorder {
     session_id: Option<String>,
     route_id: String,
     step: u64,
-    messages: Vec<Message>,
-    instructions: Vec<InstructionBlock>,
-    tools: Vec<Tool>,
     outcome: Arc<Mutex<Option<libsy::OutcomeMetadata>>>,
     selected_model: Option<ModelId>,
     served_model: Option<ModelId>,
@@ -542,6 +538,7 @@ impl TrajectoryRecorder {
         mut self,
         usage: Option<&Usage>,
         output: Option<&AggLlmResponse>,
+        upstream_request: Option<&Value>,
         latency: Duration,
         result: rsi_trace::StepResult,
     ) {
@@ -556,13 +553,28 @@ impl TrajectoryRecorder {
             .and_then(Value::as_str)
             .map(str::to_string);
         let confidence = field("confidence").and_then(Value::as_f64);
+        let confidence_threshold = field("confidence_threshold").and_then(Value::as_f64);
+        let min_success_rate = field("min_success_rate").and_then(Value::as_f64);
+        let fixed_target = field("fixed_target")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let selection = field("selection")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let candidates = field("candidates").and_then(Value::as_array).map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        });
+        let pareto_candidates =
+            field("pareto_candidates").and_then(|value| serde_json::from_value(value.clone()).ok());
         let decision = field("decision")
             .and_then(Value::as_str)
             .map(str::to_string);
         let reason = field("reason").and_then(Value::as_str).map(str::to_string);
-        let skill_version = field("skill_version")
-            .and_then(Value::as_str)
-            .map(str::to_string);
+        let skill_injected = field("skill_injected").and_then(Value::as_bool);
         let served_model = self
             .served_model
             .as_deref()
@@ -593,7 +605,13 @@ impl TrajectoryRecorder {
                 reason: reason.clone(),
                 subtask_id: subtask_id.clone(),
                 confidence,
-                skill_version: skill_version.clone(),
+                confidence_threshold,
+                min_success_rate,
+                fixed_target,
+                selection,
+                candidates,
+                pareto_candidates,
+                skill_injected,
                 selected_model: self.selected_model.as_ref().map(ToString::to_string),
                 served_model: self.served_model.as_ref().map(ToString::to_string),
                 result: result.clone(),
@@ -616,7 +634,7 @@ impl TrajectoryRecorder {
                 confidence,
                 decision,
                 reason,
-                skill_version,
+                skill_injected,
                 selected_model: self.selected_model.as_ref().map(ToString::to_string),
                 served_model: self.served_model.as_ref().map(ToString::to_string),
                 result,
@@ -624,9 +642,7 @@ impl TrajectoryRecorder {
                 cost_usd,
                 cost_source,
                 latency_ms: Some(latency_ms),
-                messages: self.messages,
-                instructions: self.instructions,
-                tools: self.tools,
+                upstream_request: upstream_request.cloned(),
                 response,
             });
         }
@@ -673,9 +689,6 @@ fn trace_capture(
         session_id,
         route_id: request.llm_request.model.clone().unwrap_or_default(),
         step: rsi_trace::step_number(&request.llm_request.messages),
-        messages: request.llm_request.messages.clone(),
-        instructions: request.llm_request.instructions.clone(),
-        tools: request.llm_request.tools.clone(),
         outcome: Arc::new(Mutex::new(None)),
         selected_model: None,
         served_model: None,
@@ -1277,10 +1290,11 @@ fn llm_json_body(
 #[allow(clippy::type_complexity, clippy::result_large_err)]
 fn resolve_route(
     state: &ServerState,
-    metadata: Metadata,
+    mut metadata: Metadata,
     mut body: Value,
     wire_format: WireFormat,
 ) -> std::result::Result<(&Route, Request), Response> {
+    metadata.caller_wire_format = Some(wire_format);
     // Only trusted translation hops may supply exact request preservation state.
     // Strip it before decoding and retaining the raw body for upstream replay.
     if let Some(metadata) = body.get_mut("metadata").and_then(Value::as_object_mut) {
@@ -1387,6 +1401,7 @@ async fn handle_llm_request(
                 trace.finish(
                     None,
                     None,
+                    None,
                     started.0.elapsed(),
                     rsi_trace::StepResult::error(error.to_string()),
                 );
@@ -1434,7 +1449,17 @@ async fn handle_llm_request(
         )
     } else {
         if let Some(trace) = trace {
-            trace.finish(None, None, started.0.elapsed(), rsi_trace::StepResult::ok());
+            let upstream_request = response
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.upstream_request.clone());
+            trace.finish(
+                None,
+                None,
+                upstream_request.as_deref(),
+                started.0.elapsed(),
+                rsi_trace::StepResult::ok(),
+            );
         }
         response
     };
@@ -2199,7 +2224,7 @@ mod tests {
             confidence: Some(0.93),
             decision: Some("subtask".to_string()),
             reason: None,
-            skill_version: Some("v2".to_string()),
+            skill_injected: Some(true),
             selected_model: Some("model/cheap".to_string()),
             served_model: Some("model/cheap".to_string()),
             result: rsi_trace::StepResult::ok(),
@@ -2207,12 +2232,10 @@ mod tests {
             cost_usd: None,
             cost_source: None,
             latency_ms: None,
-            messages: vec![Message::text(
-                switchyard_protocol::Role::User,
-                "Fix the parser",
-            )],
-            instructions: Vec::new(),
-            tools: Vec::new(),
+            upstream_request: Some(json!({
+                "model": "model/cheap",
+                "messages": [{"role": "user", "content": "Fix the parser"}]
+            })),
             response: None,
         }
     }
@@ -2236,19 +2259,13 @@ mod tests {
             session_id: Some("session-a".to_string()),
             route_id: "switchyard/rsi".to_string(),
             step: 2,
-            messages: vec![Message::text(
-                switchyard_protocol::Role::User,
-                "Fix the parser",
-            )],
-            instructions: Vec::new(),
-            tools: Vec::new(),
             outcome: Arc::new(Mutex::new(Some(libsy::OutcomeMetadata::new(
                 "rsi_router".to_string(),
                 Some(json!({
                     "decision": "subtask",
                     "subtask_id": "edit-code",
                     "confidence": 0.93,
-                    "skill_version": "v2",
+                    "skill_injected": true,
                     "recognizer": {
                         "model": "model/recognizer",
                         "prompt": "Available subtasks: edit-code",
@@ -2269,18 +2286,26 @@ mod tests {
         };
         let output =
             switchyard_protocol::text_response(Some("openai/gpt-6-luna".to_string()), "done");
+        let upstream_request = json!({
+            "model": "openai/gpt-6-luna",
+            "messages": [{"role": "user", "content": "Fix the parser"}]
+        });
         recorder.finish(
             Some(&usage),
             Some(&output),
+            Some(&upstream_request),
             Duration::from_millis(12),
             rsi_trace::StepResult::ok(),
         );
         let step = log.read_step("session-a", 2).expect("read").expect("step");
         assert_eq!(step.subtask_id.as_deref(), Some("edit-code"));
         assert_eq!(step.confidence, Some(0.93));
-        assert_eq!(step.skill_version.as_deref(), Some("v2"));
+        assert_eq!(step.skill_injected, Some(true));
         assert_eq!(step.selected_model.as_deref(), Some("openai/gpt-6-luna"));
-        assert_eq!(step.messages.len(), 1);
+        assert_eq!(
+            step.upstream_request.as_ref().expect("upstream request")["model"],
+            "openai/gpt-6-luna"
+        );
         assert_eq!(
             step.usage.as_ref().map(|usage| usage.input_tokens),
             Some(10)
@@ -2343,7 +2368,7 @@ mod tests {
         let body: Value = serde_json::from_slice(&body).expect("json");
         assert_eq!(body["session_id"], "session-a");
         assert_eq!(body["steps"].as_array().expect("steps").len(), 2);
-        assert!(body["steps"][0].get("messages").is_none());
+        assert!(body["steps"][0].get("upstream_request").is_none());
 
         let response = app
             .oneshot(
@@ -2360,7 +2385,10 @@ mod tests {
         let body: Value = serde_json::from_slice(&body).expect("json");
         assert_eq!(body["step"], 2);
         assert_eq!(body["subtask_id"], "edit-code");
-        assert_eq!(body["messages"][0]["content"][0]["text"], "Fix the parser");
+        assert_eq!(
+            body["upstream_request"]["messages"][0]["content"],
+            "Fix the parser"
+        );
     }
 
     #[tokio::test]

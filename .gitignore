@@ -173,3 +173,8 @@ pytest-of-*/
 # codex
 .codex
 openthoughts-tblite/
+
+
+.agentbench-tmp/
+dev-server/config.bak.*
+dev-server/config.toml.bak.*

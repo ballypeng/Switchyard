@@ -398,6 +398,13 @@ cache_read = 0.09
 cache_write = 0.37
 
 [[prices]]
+models = ["qwen3.5-9b","/Users/jiuwen/Models/Qwen3.5-9B-4bit"]
+input = 0
+output = 0
+cache_read = 0
+cache_write = 0
+
+[[prices]]
 models = ["qwen/qwen3.8-max-0902"]
 input = 2
 output = 6

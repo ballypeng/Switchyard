@@ -51,6 +51,17 @@ pub(crate) fn drop_exact_replay(request: &mut Request) {
     request.llm_request.preservation.requests.clear();
 }
 
+/// Inserts `text` as a new message with `role` at `index` and disables exact
+/// replay so the edit reaches the provider. An index past the end appends.
+pub(crate) fn insert_message(request: &mut Request, index: usize, role: Role, text: &str) {
+    let index = index.min(request.llm_request.messages.len());
+    request
+        .llm_request
+        .messages
+        .insert(index, Message::text(role, text));
+    drop_exact_replay(request);
+}
+
 /// Prepends a system prompt and disables exact replay so the edit reaches the provider.
 pub(crate) fn prepend_system_prompt(request: &mut Request, prompt: &str) {
     request.llm_request.instructions.insert(
@@ -128,6 +139,36 @@ mod tests {
                 }
             ]
         );
+    }
+
+    #[test]
+    fn an_inserted_message_lands_at_the_index() {
+        let mut request = request_with(vec![
+            Message::text(Role::User, "hi"),
+            Message::text(Role::Assistant, "done"),
+        ]);
+
+        insert_message(&mut request, 1, Role::System, NOTE);
+
+        let messages = &request.llm_request.messages;
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[1].role, Role::System);
+        assert_eq!(messages[1].text_content(""), Some(NOTE.to_string()));
+        assert!(
+            !replays_exactly(&request),
+            "a same-format hop would replay the body captured before the message"
+        );
+    }
+
+    #[test]
+    fn an_insert_past_the_end_appends() {
+        let mut request = request_with(vec![Message::text(Role::User, "hi")]);
+
+        insert_message(&mut request, 9, Role::User, NOTE);
+
+        let messages = &request.llm_request.messages;
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1].text_content(""), Some(NOTE.to_string()));
     }
 
     #[test]

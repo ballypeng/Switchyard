@@ -7,6 +7,7 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::ready;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
@@ -278,7 +279,7 @@ impl TranslatingLlmClient {
                 })?;
         let Request {
             mut llm_request,
-            metadata,
+            mut metadata,
             ..
         } = request;
         llm_request.model = Some(model.to_string());
@@ -287,7 +288,7 @@ impl TranslatingLlmClient {
                 backend,
                 wire_format,
                 llm_request,
-                metadata.as_ref(),
+                metadata.as_mut(),
                 model,
                 UpstreamEndpoint::Auxiliary(operation),
             )
@@ -318,7 +319,7 @@ impl TranslatingLlmClient {
         backend: &Backend,
         wire_format: WireFormat,
         llm_request: LlmRequest,
-        metadata: Option<&Metadata>,
+        metadata: Option<&mut Metadata>,
         model: &ModelId,
         endpoint: UpstreamEndpoint,
     ) -> Result<EncodedResponse> {
@@ -381,7 +382,7 @@ impl TranslatingLlmClient {
         record_gen_ai_request(&url, model, streaming);
 
         let result = self
-            .send_with_retries(&url, backend, &body, metadata, model, streaming)
+            .send_with_retries(&url, backend, &body, metadata.as_deref(), model, streaming)
             .await;
         // Keep quota failures request-local when forwarding auth or returning 429 to callers.
         if let Some(until) = unavailable_until
@@ -392,6 +393,13 @@ impl TranslatingLlmClient {
         {
             let deadline = duration_millis(self.cooldown_epoch.elapsed().saturating_add(cooldown));
             until.fetch_max(deadline, Ordering::Relaxed);
+        }
+        // The body is the exact bytes the upstream accepted: model forced, backend
+        // transforms merged. Failed calls leave it unset because they carry no response.
+        if result.is_ok()
+            && let Some(metadata) = metadata
+        {
+            metadata.upstream_request = Some(Arc::new(body));
         }
         // Let cooldown expire naturally; a successful in-flight call may overlap a newer failure.
         result
@@ -646,7 +654,7 @@ impl TranslatingLlmClient {
     ) -> Result<Response> {
         let Request {
             mut llm_request,
-            metadata,
+            mut metadata,
             ..
         } = request;
 
@@ -678,7 +686,7 @@ impl TranslatingLlmClient {
                 backend,
                 wire_format,
                 llm_request,
-                metadata.as_ref(),
+                metadata.as_mut(),
                 &model_id,
                 UpstreamEndpoint::Completion,
             )
@@ -2054,6 +2062,54 @@ mod tests {
             .await?;
         let agg = response.llm_response.into_agg().await?;
         assert_eq!(completion_text(&agg), "Hi there");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn successful_calls_carry_the_upstream_request_body()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        let server = MockServer::start().await;
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_for_mock = Arc::clone(&seen);
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(move |request: &wiremock::Request| {
+                if let Ok(value) = serde_json::from_slice::<Value>(&request.body) {
+                    seen_for_mock.lock().expect("lock").push(value);
+                }
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "id": "chatcmpl-1",
+                    "model": "gpt",
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "Hi there"},
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {}
+                }))
+            })
+            .mount(&server)
+            .await;
+
+        let client = TranslatingLlmClient::new(&chat_map(&format!("{}/v1", server.uri())))?;
+        let mut request = request_for(Some("gpt"), false);
+        request.metadata = Some(Metadata::default());
+
+        let response = client.call_rewrite_model(request, None).await?;
+
+        let upstream = response
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.upstream_request.as_ref())
+            .expect("the client records the body it sent upstream");
+        assert_eq!(upstream["model"], "gpt");
+        assert!(upstream.get("stream").is_none());
+        let seen = seen.lock().expect("lock");
+        let [received] = seen.as_slice() else {
+            panic!("expected exactly one upstream call");
+        };
+        assert_eq!(received, upstream.as_ref());
 
         Ok(())
     }

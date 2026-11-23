@@ -413,18 +413,21 @@ pub enum PlanExecuteTrigger {
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum RsiSelectionConfig {
+    /// Try the highest success-rate candidate first.
+    HighestSuccess,
     /// Try the lowest cost candidate first.
     #[default]
     LowestCost,
-    /// Keep the order the subtask dictionary supplied.
-    CatalogOrder,
+    /// Try the lowest latency candidate first.
+    LowestLatency,
 }
 
 impl From<RsiSelectionConfig> for RsiSelection {
     fn from(value: RsiSelectionConfig) -> Self {
         match value {
+            RsiSelectionConfig::HighestSuccess => Self::HighestSuccess,
             RsiSelectionConfig::LowestCost => Self::LowestCost,
-            RsiSelectionConfig::CatalogOrder => Self::CatalogOrder,
+            RsiSelectionConfig::LowestLatency => Self::LowestLatency,
         }
     }
 }
@@ -442,41 +445,51 @@ pub struct RsiRouteConfig {
     /// Lowest confidence that still enters the candidate route, from 0 to 1.
     #[serde(default = "default_rsi_confidence_threshold")]
     pub confidence_threshold: f64,
+    /// Candidates below this success rate are removed before selection, from 0
+    /// to 1. `0` keeps every candidate.
+    #[serde(default = "default_rsi_min_success_rate")]
+    pub min_success_rate: f64,
     /// How many recent steps the recognizer sees.
     #[serde(default = "default_rsi_history_steps")]
     pub history_steps: usize,
     /// Candidate ordering.
     #[serde(default)]
     pub selection: RsiSelectionConfig,
+    /// Serves every recognized step with this target instead of selecting
+    /// from the dictionary candidates. The recognized subtask's skill still
+    /// comes from the candidate matching this target.
+    #[serde(default)]
+    pub fixed_target: Option<String>,
+    /// Appends the selected candidate's skill reminder to the request.
+    /// Defaults to true.
+    #[serde(default = "default_true")]
+    pub skill_injected: bool,
     /// Replaces the packaged recognition prompt.
     #[serde(default)]
     pub recognizer_prompt: Option<String>,
     /// Most output tokens the recognizer may use.
     #[serde(default = "default_classifier_max_output_tokens")]
     pub max_output_tokens: u64,
-    /// Environment variable holding the Redis URL.
-    pub redis_url_env: String,
-    /// Redis key holding the whole subtask catalog as a JSON array.
-    #[serde(default = "default_rsi_catalog_key")]
-    pub redis_catalog_key: String,
-    /// Whole-catalog read timeout in milliseconds.
-    #[serde(default = "default_rsi_redis_timeout_ms")]
-    pub redis_timeout_ms: u64,
+    /// Environment variable holding the MySQL URL.
+    pub mysql_url_env: String,
+    /// One catalog query timeout in milliseconds.
+    #[serde(default = "default_rsi_mysql_timeout_ms")]
+    pub mysql_timeout_ms: u64,
 }
 
 fn default_rsi_confidence_threshold() -> f64 {
     0.7
 }
 
+fn default_rsi_min_success_rate() -> f64 {
+    0.0
+}
+
 fn default_rsi_history_steps() -> usize {
     3
 }
 
-fn default_rsi_catalog_key() -> String {
-    "rsi:subtasks".to_string()
-}
-
-fn default_rsi_redis_timeout_ms() -> u64 {
+fn default_rsi_mysql_timeout_ms() -> u64 {
     2_000
 }
 
@@ -2212,12 +2225,19 @@ fn build_rsi(
             tracing::warn!(
                 route = route_name,
                 %error,
-                "rsi_router has no usable Redis catalog; requests will use the flagship model"
+                "rsi_router has no usable MySQL catalog; requests will use the flagship model"
             );
-            Arc::new(crate::rsi_catalog::UnavailableSubtaskCatalog::new(error))
+            Arc::new(crate::mysql_catalog::UnavailableSubtaskCatalog::new(error))
                 as Arc<dyn SubtaskCatalog>
         }
     };
+    let fixed_target = config
+        .fixed_target
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(|name| resolve_target_model_id(route_name, name, targets))
+        .transpose()?;
     let algorithm = RsiRouter::new(RsiRouterConfig {
         recognizer,
         flagship,
@@ -2227,10 +2247,13 @@ fn build_rsi(
             .clone()
             .unwrap_or_else(|| DEFAULT_RSI_RECOGNIZER_PROMPT.trim().to_string()),
         confidence_threshold: config.confidence_threshold,
+        min_success_rate: config.min_success_rate,
         history_steps: config.history_steps,
         selection: config.selection.into(),
         max_output_tokens: config.max_output_tokens,
         catalog,
+        fixed_target,
+        skill_injected: config.skill_injected,
     })
     .map_err(|error| {
         AlgorithmConfigError::with_source(format!("rsi_router route {route_name}: {error}"), error)
@@ -2240,15 +2263,14 @@ fn build_rsi(
 
 #[cfg(not(target_os = "wasi"))]
 fn build_rsi_catalog(config: &RsiRouteConfig) -> Result<Arc<dyn SubtaskCatalog>, String> {
-    if config.redis_url_env.trim().is_empty() {
-        return Err("redis_url_env is empty".to_string());
+    if config.mysql_url_env.trim().is_empty() {
+        return Err("mysql_url_env is empty".to_string());
     }
-    let redis_url = std::env::var(&config.redis_url_env)
-        .map_err(|_| format!("environment variable {} is not set", config.redis_url_env))?;
-    let catalog = crate::rsi_catalog::RedisSubtaskCatalog::new(
-        &redis_url,
-        config.redis_catalog_key.clone(),
-        Duration::from_millis(config.redis_timeout_ms),
+    let mysql_url = std::env::var(&config.mysql_url_env)
+        .map_err(|_| format!("environment variable {} is not set", config.mysql_url_env))?;
+    let catalog = crate::mysql_catalog::MySqlSubtaskCatalog::new(
+        &mysql_url,
+        Duration::from_millis(config.mysql_timeout_ms),
     )
     .map_err(|error| error.to_string())?;
     Ok(Arc::new(catalog))
@@ -2280,9 +2302,9 @@ fn validate_rsi_targets(route_name: &str, config: &RsiRouteConfig) -> AlgorithmR
             )));
         }
     }
-    if config.redis_timeout_ms == 0 {
+    if config.mysql_timeout_ms == 0 {
         return Err(AlgorithmConfigError::new(format!(
-            "rsi_router route {route_name}: redis_timeout_ms must be at least 1"
+            "rsi_router route {route_name}: mysql_timeout_ms must be at least 1"
         )));
     }
     Ok(())

@@ -140,10 +140,10 @@ type = "rsi_router"
 recognizer_target = "recognizer"
 flagship_target = "flagship"
 candidate_targets = ["cheap", "mid"]
-redis_url_env = "SWITCHYARD_RSI_TEST_REDIS_URL"
+mysql_url_env = "SWITCHYARD_RSI_TEST_MYSQL_URL"
 "#;
 
-const RSI_REDIS_ENV: &str = "SWITCHYARD_RSI_TEST_REDIS_URL";
+const RSI_MYSQL_ENV: &str = "SWITCHYARD_RSI_TEST_MYSQL_URL";
 static RSI_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn lock_rsi_env() -> std::sync::MutexGuard<'static, ()> {
@@ -157,7 +157,7 @@ fn rsi_deployment_builds_from_configured_targets() {
     let _env = lock_rsi_env();
     // The test owns this variable name, so no other test reads it.
     unsafe {
-        std::env::set_var(RSI_REDIS_ENV, "redis://127.0.0.1:6379");
+        std::env::set_var(RSI_MYSQL_ENV, "mysql://127.0.0.1:3306/switchyard");
     }
     let factory = AlgorithmFactory::from_toml(RSI_DEPLOYMENT).expect("deployment should parse");
     let algorithms = factory.build().expect("rsi route should build");
@@ -200,20 +200,20 @@ fn rsi_deployment_builds_from_configured_targets() {
         ["recognizer"]
     );
     unsafe {
-        std::env::remove_var(RSI_REDIS_ENV);
+        std::env::remove_var(RSI_MYSQL_ENV);
     }
 }
 
 #[test]
-fn rsi_deployment_builds_without_redis_url() {
+fn rsi_deployment_builds_without_mysql_url() {
     let _env = lock_rsi_env();
     unsafe {
-        std::env::remove_var(RSI_REDIS_ENV);
+        std::env::remove_var(RSI_MYSQL_ENV);
     }
     let factory = AlgorithmFactory::from_toml(RSI_DEPLOYMENT).expect("deployment should parse");
     let algorithms = factory
         .build()
-        .expect("rsi route should build without Redis");
+        .expect("rsi route should build without MySQL");
     assert_eq!(algorithms["public/rsi"].0.name(), "rsi_router");
 }
 
@@ -221,7 +221,7 @@ fn rsi_deployment_builds_without_redis_url() {
 fn invalid_rsi_configuration_is_rejected() {
     let _env = lock_rsi_env();
     unsafe {
-        std::env::set_var(RSI_REDIS_ENV, "redis://127.0.0.1:6379");
+        std::env::set_var(RSI_MYSQL_ENV, "mysql://127.0.0.1:3306/switchyard");
     }
     for (source, expected) in [
         (
@@ -253,7 +253,7 @@ fn invalid_rsi_configuration_is_rejected() {
         assert!(error.to_string().contains(expected), "{error}");
     }
     unsafe {
-        std::env::remove_var(RSI_REDIS_ENV);
+        std::env::remove_var(RSI_MYSQL_ENV);
     }
 }
 

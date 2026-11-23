@@ -25,9 +25,9 @@ LogsDirectory=switchyard
 
 Restart=on-failure
 Environment="NVIDIA_API_KEY=<PUT-THE-KEY-HERE>"
-# The switchyard/rsi route reads its dictionary from Redis. Change this URL if
-# Redis runs elsewhere. A lookup failure falls back to the flagship model.
-Environment="RSI_REDIS_URL=redis://127.0.0.1:6379/0"
+# The switchyard/rsi route reads its dictionary from MySQL. Change this URL if
+# MySQL runs elsewhere. A lookup failure falls back to the flagship model.
+Environment="RSI_MYSQL_URL=mysql://127.0.0.1:3306/switchyard"
 
 PrivateDevices=yes
 ProtectHome=yes
